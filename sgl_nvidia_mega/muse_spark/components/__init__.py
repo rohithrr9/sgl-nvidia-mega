@@ -114,6 +114,47 @@ ENTRY: dict[str, str] = {
     "sp_fp4_dispatch": "engage",
 }
 
+# Components with a package for one GPU architecture: on a node of that compute capability the loader imports the
+# architecture's package in place of the component's own module. verify_mk on GB300 (10, 3) is ``muse_spark/sm103``
+# (TensorRT-LLM's megakernel ported to sm_103a, with its host runner); every other device keeps ``verify_mk`` here.
+ARCH_MODULES: dict[str, dict[tuple[int, int], str]] = {
+    "verify_mk": {(10, 3): "sgl_nvidia_mega.muse_spark.sm103.verify_mk"},
+}
+
+
+def _capability() -> tuple[int, int] | None:
+    """This node's GPU compute capability, or None. Read through NVML, so loading the components never initializes
+    CUDA in the process."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            return int(major), int(minor)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001 - no NVML: every component's own module
+        return None
+
+
+def _module_name(name: str) -> str:
+    """The module the loader imports for component ``name`` on this node."""
+    by_arch = ARCH_MODULES.get(name)
+    if by_arch:
+        cc = _capability()
+        if cc in by_arch:
+            logger.info(
+                "muse_spark: %s from %s (compute capability %d.%d)",
+                name,
+                by_arch[cc],
+                *cc,
+            )
+            return by_arch[cc]
+    return f"{__name__}.{name}"
+
+
 _registered: dict[str, bool] | None = None
 
 
@@ -219,7 +260,7 @@ def register_all() -> dict[str, bool]:
     _registered = {}
     for name in COMPONENTS:
         try:
-            mod = importlib.import_module(f"{__name__}.{name}")
+            mod = importlib.import_module(_module_name(name))
             ok = bool(getattr(mod, ENTRY.get(name, "register"))())
         except Exception as e:  # noqa: BLE001 - a failed opt-in leaves SGLang stock
             bed.report(
