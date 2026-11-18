@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from ..vendor.trtllm_ab93b78.megakernel import layer_mk, rl, serving
+from ..trtllm_ab93b78.megakernel import layer_mk, rl, serving
 from . import comm as sg_comm
 from . import kv, stages
 
@@ -331,7 +331,7 @@ class SgMegakernel(serving.ServedMegakernel):
         if (
             qkv is not None
         ):  # a sliding-window layer with the check build's QKV output (stages)
-            from ..vendor.trtllm_ab93b78.megakernel import library
+            from ..trtllm_ab93b78.megakernel import library
 
             layer = blocks[index]
             mk, blk = (

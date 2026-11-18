@@ -33,7 +33,7 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from ..vendor.trtllm_ab93b78.megakernel import layer_mk, moe_hops
+from ..trtllm_ab93b78.megakernel import layer_mk, moe_hops
 
 ROWS = 8
 ATTN_COLS = 1024  # this rank's 16 query heads of 64

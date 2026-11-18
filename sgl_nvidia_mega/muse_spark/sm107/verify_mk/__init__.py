@@ -3,7 +3,7 @@
 """verify_mk: TensorRT-LLM's Rubin (sm_107) decode megakernel on layers 1-60 of the TP8 one-request target-verify step.
 
 Opt-in with ``MUSE_VR_VERIFY_MK=1`` (default off). The kernel and its host code are TensorRT-LLM's
-(``vendor/trtllm_ab93b78``, vendor/README.md); this package runs them on SGLang's model, KV cache and TP group:
+(``sm107/trtllm_ab93b78``, sm107/README.md); this package runs them on SGLang's model, KV cache and TP group:
 
 * ``facades``: TensorRT-LLM-shaped views of SGLang's decoder layers, and the replicated expert stacks;
 * ``comm``: the cross-GPU workspaces on SGLang's TP group (torch symmetric memory with multicast) in place of
@@ -42,7 +42,7 @@ from typing import Callable, List
 
 import torch
 
-from .. import bed
+from ...components import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
@@ -113,7 +113,7 @@ def register() -> bool:
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    from .. import sgl_compat
+    from ...components import sgl_compat
 
     target = sgl_compat.target(TARGET)
     HookRegistry.register(target, _around_install, HookType.AROUND)
@@ -194,7 +194,7 @@ def install(model: torch.nn.Module, capture_tail_hooks: list) -> None:
     raise on every rank. Collective over the TP group."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    from ..vendor.trtllm_ab93b78.megakernel import library, serving
+    from ..trtllm_ab93b78.megakernel import library, serving
     from . import comm as sg_comm
     from . import facades, runtime
 

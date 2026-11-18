@@ -20,7 +20,7 @@ from typing import List, Sequence
 import torch
 import torch.distributed as dist
 
-from ..vendor.trtllm_ab93b78.megakernel import layer_mk, moe_hops, rl
+from ..trtllm_ab93b78.megakernel import layer_mk, moe_hops, rl
 
 
 class TpComm:

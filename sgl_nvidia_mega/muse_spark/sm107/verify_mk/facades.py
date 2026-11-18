@@ -32,8 +32,8 @@ from typing import Dict, List
 import torch
 import torch.distributed as dist
 
-from ..vendor.trtllm_ab93b78.megakernel import experts as mk_experts
-from ..vendor.trtllm_ab93b78.megakernel import layer_mk, moe_hops, qkv
+from ..trtllm_ab93b78.megakernel import experts as mk_experts
+from ..trtllm_ab93b78.megakernel import layer_mk, moe_hops, qkv
 
 LAYERS = 62
 RANKS = 8

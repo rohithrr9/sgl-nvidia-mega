@@ -114,6 +114,18 @@ ENTRY: dict[str, str] = {
     "sp_fp4_dispatch": "engage",
 }
 
+# Components whose code lives in an architecture folder of muse_spark rather than in this package: verify_mk
+# (TensorRT-LLM's Rubin decode megakernel and its host runner) is muse_spark/sm107.
+MODULES: dict[str, str] = {
+    "verify_mk": "sgl_nvidia_mega.muse_spark.sm107.verify_mk",
+}
+
+
+def _module_name(name: str) -> str:
+    """The module the loader imports for component ``name``."""
+    return MODULES.get(name, f"{__name__}.{name}")
+
+
 _registered: dict[str, bool] | None = None
 
 
@@ -219,7 +231,7 @@ def register_all() -> dict[str, bool]:
     _registered = {}
     for name in COMPONENTS:
         try:
-            mod = importlib.import_module(f"{__name__}.{name}")
+            mod = importlib.import_module(_module_name(name))
             ok = bool(getattr(mod, ENTRY.get(name, "register"))())
         except Exception as e:  # noqa: BLE001 - a failed opt-in leaves SGLang stock
             bed.report(

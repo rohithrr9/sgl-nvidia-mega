@@ -20,14 +20,15 @@ import torch
 import torch.distributed as dist
 
 import sgl_nvidia_mega
+import sgl_nvidia_mega.muse_spark.sm107  # noqa: F401 - the real package, so the stand-ins below go inside it
 from sgl_nvidia_mega.muse_spark.components import sgl_compat
 
 COMPONENTS = "sgl_nvidia_mega.muse_spark.components"
-VERIFY_MK = f"{COMPONENTS}.verify_mk"
-MEGAKERNEL = f"{COMPONENTS}.vendor.trtllm_ab93b78.megakernel"
+SM107 = "sgl_nvidia_mega.muse_spark.sm107"
+VERIFY_MK = f"{SM107}.verify_mk"
+MEGAKERNEL = f"{SM107}.trtllm_ab93b78.megakernel"
 VENDOR = (
-    Path(sgl_nvidia_mega.__file__).resolve().parent
-    / "muse_spark/components/vendor/trtllm_ab93b78"
+    Path(sgl_nvidia_mega.__file__).resolve().parent / "muse_spark/sm107/trtllm_ab93b78"
 )
 ROWS, HIDDEN = 8, 8192
 
@@ -1137,7 +1138,7 @@ def test_mc_view(mods):
         buf.get_mc_buffer((1025,), torch.float32, 0)
 
 
-# ---- the vendored TensorRT-LLM files (vendor/README.md) ----
+# ---- the vendored TensorRT-LLM files (sm107/README.md) ----
 MODIFIED = {
     "megakernel/library.py",
     "megakernel/msoMegakernel.cu",
@@ -1167,4 +1168,16 @@ def test_vendored_files_name_their_origin():
         (VENDOR / "LICENSE.tensorrt_llm")
         .read_text()
         .startswith("Copyright (c) 2011-2026 NVIDIA CORPORATION")
+    )
+
+
+# ---- the component loader: verify_mk from muse_spark/sm107 ----
+
+
+def test_loader_takes_verify_mk_from_sm107():
+    components = importlib.import_module(COMPONENTS)
+    assert components._module_name("verify_mk") == VERIFY_MK
+    assert (
+        components._module_name("verify_topk_sample")
+        == f"{COMPONENTS}.verify_topk_sample"
     )

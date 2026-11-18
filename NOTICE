@@ -78,8 +78,8 @@ Copyright SGLang Team), with a signed-zero tie rule.
 
 Portions are copied from TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM): the Rubin
 (sm_107) decode megakernel of Muse Spark Open and its host code in
-sgl_nvidia_mega/muse_spark/components/vendor/trtllm_ab93b78/, at commit
+sgl_nvidia_mega/muse_spark/sm107/trtllm_ab93b78/, at commit
 ab93b785a476f01d2f1e1907c930780fc6d7832e (Apache License 2.0, Copyright (c) 2011-2026 NVIDIA
 CORPORATION & AFFILIATES), unchanged or with a "Modified by NVIDIA" header;
-components/vendor/README.md lists the files. TensorRT-LLM's license, with the third-party
-notices it carries, is kept in components/vendor/trtllm_ab93b78/LICENSE.tensorrt_llm.
+muse_spark/sm107/README.md lists the files. TensorRT-LLM's license, with the third-party
+notices it carries, is kept in muse_spark/sm107/trtllm_ab93b78/LICENSE.tensorrt_llm.
