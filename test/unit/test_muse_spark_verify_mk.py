@@ -550,10 +550,15 @@ def test_backend_type(env, monkeypatch):
 
 
 def test_binding_limit(env):
-    for _ in range(4):  # a new positions buffer each time: a new binding
-        env.args[1] = torch.arange(ROWS, dtype=torch.int64)
+    # A new positions buffer each time: a new binding. Bindings are keyed by buffer address, so every buffer stays
+    # alive: a freed buffer's address can come back for the next one and match an earlier binding.
+    held = []
+    for _ in range(4):
+        held.append(torch.arange(ROWS, dtype=torch.int64))
+        env.args[1] = held[-1]
         assert env.mk.begin_sg(*env.args)
-    env.args[1] = torch.arange(ROWS, dtype=torch.int64)
+    held.append(torch.arange(ROWS, dtype=torch.int64))
+    env.args[1] = held[-1]
     assert not env.mk.begin_sg(*env.args) and "binding limit" in env.mk.last_refusal
     assert env.mk.refused_bindings == 1 and len(env.builds) == 4
 
