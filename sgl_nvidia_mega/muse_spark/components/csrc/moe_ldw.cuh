@@ -568,12 +568,24 @@ constexpr int kErrEcCount = 512;  // tests only: a participant count of an early
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
-// CTA abort flag (shared memory; set on the first expired wait of any thread of the CTA)
+// CTA abort flag (shared memory; set on the first expired wait of any thread of the CTA). Every access to it is a
+// strong CTA-scope operation on the shared state space, so the setter and the pollers are morally strong and do not
+// form a data race (PTX ISA, memory consistency model: "Morally strong operations", "Conflict and Data-races").
 __shared__ int g_abort;
-__device__ __forceinline__ bool aborted() { return *reinterpret_cast<volatile int*>(&g_abort) != 0; }
+__device__ __forceinline__ bool aborted() {
+  uint32_t v;
+  asm volatile("ld.relaxed.cta.shared.u32 %0, [%1];" : "=r"(v) : "r"(smem_u32(&g_abort)));
+  return v != 0u;
+}
+__device__ __forceinline__ void abort_reset() {
+  asm volatile("st.relaxed.cta.shared.u32 [%0], %1;" ::"r"(smem_u32(&g_abort)), "r"(0u) : "memory");
+}
 __device__ __noinline__ void fail(int32_t* err, int code) {
   atomicOr(err, code);
-  *reinterpret_cast<volatile int*>(&g_abort) = 1;
+  uint32_t old;
+  asm volatile("atom.relaxed.cta.shared.exch.b32 %0, [%1], %2;" : "=r"(old) : "r"(smem_u32(&g_abort)), "r"(1u)
+               : "memory");
+  (void)old;
 }
 __device__ __forceinline__ bool elect_one() {
   uint32_t pred;
@@ -3631,7 +3643,7 @@ __global__ void __launch_bounds__(kThreads, 1) ldw_kernel(const __grid_constant_
   Smem& s = *reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   if (tid == 0) {
-    g_abort = 0;
+    abort_reset();
     LDW_STAMP(p, kStStart);
   }
   if (warp == 3) {
