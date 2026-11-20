@@ -13,6 +13,12 @@ the partials with the same code and block size and writes one column range with 
 
 Any other case (more than 128 rows, small vocabularies, devices where FlashInfer picks another softmax kernel, other
 dtypes, CUDA-graph capture) calls the stock function.
+
+``MUSE_VR_SOFTMAX_SPLIT_STEP_GRAPHS=1`` (default off): the split also runs under any
+CUDA-graph capture (``step_graphs``' segment captures, not only ``sampling_graph``'s) once an eager call on that device
+has loaded the module and made a workspace that holds the captured shape; until then a capture keeps the stock
+function. ``step_graphs`` captures a segment after it ran eagerly three times, so its sampling graphs record the split
+pass. The capture allocates nothing but the output (in the graph's pool) and reads nothing from the host.
 """
 
 from __future__ import annotations
@@ -38,6 +44,9 @@ logger = logging.getLogger(__name__)
 NAME = "softmax_split"  # env MUSE_VR_SOFTMAX_SPLIT
 TARGET = "sglang.kernels.ops.speculative.dspark.dspark_accept.softmax_temp_flashinfer"
 ENV_COLS = "MUSE_VR_SOFTMAX_SPLIT_COLS"
+ENV_STEP_GRAPHS = (
+    "MUSE_VR_SOFTMAX_SPLIT_STEP_GRAPHS"  # also under step_graphs' captures once warm
+)
 _TARGET_BLOCKS = 256  # normalization blocks over all rows; tunable (tests/test_softmax_split.py --bench --cols ...)
 _CUH = Path(__file__).resolve().parent / "csrc" / "softmax_split.cuh"
 # FlashInfer OnlineSoftmax regime that this mirrors: vocabulary splitting for small batches and large vocabularies
@@ -154,10 +163,26 @@ def _cols(rows: int, vocab: int) -> int:
     return max(8192, -(-want // 4096) * 4096)
 
 
+def _ws_need(rows: int, vocab: int) -> int:
+    return rows * (-(-vocab // _SLICE)) * 8
+
+
+def _warm(logits_2d: torch.Tensor) -> bool:
+    """An eager call on this device ran the split (module loaded, column count fixed) and its workspace holds this
+    shape: a capture then allocates nothing but the output."""
+    dev = logits_2d.device
+    ws = _ws.get(dev.index)
+    return (
+        bool(_ws.get(("warm", dev.index)))
+        and ws is not None
+        and ws.numel() >= _ws_need(*logits_2d.shape)
+    )
+
+
 def split_softmax(logits_2d: torch.Tensor, temp_per_row: torch.Tensor) -> torch.Tensor:
     rows, vocab = logits_2d.shape
     dev = logits_2d.device
-    need = rows * (-(-vocab // _SLICE)) * 8
+    need = _ws_need(rows, vocab)
     ws = _ws.get(dev.index)
     if ws is None or ws.numel() < need:
         ws = _ws[dev.index] = torch.empty(
@@ -167,6 +192,8 @@ def split_softmax(logits_2d: torch.Tensor, temp_per_row: torch.Tensor) -> torch.
     _jit_module().run(
         ws, logits_2d, out, temp_per_row, 1.0, _cols(rows, vocab), _pdl(dev)
     )
+    if not torch.cuda.is_current_stream_capturing():
+        _ws[("warm", dev.index)] = True
     return out
 
 
@@ -183,8 +210,10 @@ def eligible(logits_2d: torch.Tensor) -> str | None:
     if not _stock_kernel_family(logits_2d.device.index):
         return "device uses another softmax kernel"
     if torch.cuda.is_current_stream_capturing():
-        # allowed only inside ``sampling_graph``'s capture (workspace from its warm-up); that component is a host-side
-        # runtime one and is not part of this package, so a capture is always refused here
+        # sampling_graph's capture (workspace from its warm-up) is not part of this package; with
+        # MUSE_VR_SOFTMAX_SPLIT_STEP_GRAPHS=1 any capture runs the split once an eager call made the workspace
+        if bed.flag(NAME + "_step_graphs") and _warm(logits_2d):
+            return None
         return "graph capture"
     return None
 

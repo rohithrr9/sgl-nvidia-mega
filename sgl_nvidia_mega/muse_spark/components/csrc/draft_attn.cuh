@@ -17,6 +17,19 @@
 // release and waits with acquire, and CTA s normalizes its column slice from its own shared memory
 // (PTX ISA: barrier.cluster, st.shared::cluster, memory consistency model).
 //
+// kKeyParts = 4 (default 2): every CTA's key range of a load round is scored by 4 warps per row slice instead of 2 (shorter
+// per-warp chains); the four partials are combined in part order (max, then scaled sums left to right). This changes the
+// summation order of the softmax and output reductions (draft-numerics class); kKeyParts = 2 is the code path above, unchanged.
+//
+// kRowSplit = 2: the kQ * kGroup query rows of a (request, KV head) are split over two clusters (rows of the first and the
+// second half of the query tokens), each CTA with 4 warps (2 row slices x the same 2 key halves); every row sees the same key
+// partition, the same per-warp key halves and the same combine order, so the outputs are bit-identical to kRowSplit = 1.
+//
+// kPreKV: the sequence lengths, the page table and the K / V rows of the positions before the block (written before this
+// forward, never by a kernel of the dependency chain) are read and the first load round's copies for those keys issued
+// before griddepcontrol.wait; the query rows and the block's own keys (written by the preceding kernels) are loaded after
+// it. Same data, same arithmetic: the outputs are bit-identical (tests/test_draft_attn.py).
+//
 // Numerics: same operand precisions as the stock kernel it replaces (bf16 Q, K, V; fp32 scores and accumulators;
 // bf16 probabilities); the order of the softmax and output reductions differs.
 
@@ -42,8 +55,7 @@ constexpr int kLd = kD + kPad;    // shared row stride (elements)
 constexpr int kKeyBlock = 64;     // keys per inner block
 constexpr int kResident = 3;      // key blocks loaded together (one load round covers up to 192 keys)
 constexpr int kMaxHalf = kResident * kKeyBlock / 2;  // keys scored by one warp in one pass
-constexpr int kWarps = 8;         // 4 row slices of 16 x 2 key halves
-constexpr int kThreads = kWarps * 32;
+// threads per CTA: (4 / kRowSplit) row slices of 16 x 2 key halves, one warp each (kThreadsFor below)
 
 struct Params {
   const bf16_t* q;  // [T, Hq, 128]
@@ -119,9 +131,9 @@ SGL_DEVICE uint32_t map_cta(uint32_t local_addr, uint32_t cta) {
   return remote;
 }
 
-template <int kQ, int kGroup, int kSplits>
+template <int kQ, int kGroup, int kSplits, int kRowSplit = 1, int kKeyParts = 2>
 struct Smem {
-  static constexpr int kRows = kQ * kGroup;
+  static constexpr int kRows = kQ * kGroup / kRowSplit;  // query rows of this CTA
   static constexpr int kDS = kD / kSplits;  // output columns combined by each CTA
   __nv_bfloat16 q[kRows * kLd];
   union {
@@ -129,34 +141,44 @@ struct Smem {
       __nv_bfloat16 k[kResident * kKeyBlock * kLd];
       __nv_bfloat16 v[kResident * kKeyBlock * kLd];
     } kv;
-    struct {  // second key half's partial, handed to the first half's warps
-      float o[kRows * kD];
-      float m[kRows];
-      float l[kRows];
+    struct {  // the other key parts' partials, handed to the first part's warps
+      float o[kKeyParts - 1][kRows * kD];
+      float m[kKeyParts - 1][kRows];
+      float l[kKeyParts - 1][kRows];
     } half;
   } u;
   float2 rml[kSplits][kRows];      // (row maximum, row sum) of every CTA (pushed by the peers)
   float ro[kSplits][kRows][kDS];   // this CTA's output columns from every CTA
 };
 
-template <int kQ, int kGroup, int kSplits, bool kUsePDL>
-__global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_constant__ Params p) {
-  using S = Smem<kQ, kGroup, kSplits>;
+template <int kRowSplit, int kKeyParts = 2>
+inline constexpr int kThreadsFor = (4 / kRowSplit) * kKeyParts * 32;  // row slices x key parts
+
+template <int kQ, int kGroup, int kSplits, bool kUsePDL, bool kEarlyTrigger = false, bool kPreKV = false, int kRowSplit = 1,
+          int kKeyParts = 2>
+__global__ void __launch_bounds__(kThreadsFor<kRowSplit, kKeyParts>, 1) draft_attn_kernel(const __grid_constant__ Params p) {
+  using S = Smem<kQ, kGroup, kSplits, kRowSplit, kKeyParts>;
   constexpr int kRows = S::kRows;
   constexpr int kDS = S::kDS;
-  static_assert(kRows == 4 * 16, "four 16-row slices");
+  constexpr int kRS = 4 / kRowSplit;  // 16-row slices per CTA
+  constexpr int kThreads = kThreadsFor<kRowSplit, kKeyParts>;
+  static_assert(kRowSplit == 1 || kRowSplit == 2, "row split");
+  static_assert(kKeyParts == 2 || kKeyParts == 4, "key parts");
+  static_assert(kRows == kRS * 16, "16-row slices");
   static_assert(kDS == 8, "one 8-column fragment tile per CTA");
   extern __shared__ __align__(16) uint8_t smem_raw[];
   S& sm = *reinterpret_cast<S*>(smem_raw);
 
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-  const int rs = warp & 3, kh = warp >> 2;
+  const int rs = warp % kRS, kh = warp / kRS;
   const int split = static_cast<int>(cluster_ctarank());
-  const int cl = static_cast<int>(blockIdx.x) / kSplits;
+  const int cl = static_cast<int>(blockIdx.x) / kSplits / kRowSplit;
+  const int rh = (static_cast<int>(blockIdx.x) / kSplits) % kRowSplit;  // row half (kRowSplit = 2)
+  const int row0 = rh * kRows;                                            // first global query row of this CTA
   const int req = cl / p.num_kv_heads, kvh = cl % p.num_kv_heads;
 
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-  device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (!kPreKV) device::PDLWaitPrimary<kUsePDL>();
   const int seqlen = p.seqlens[req];
   const int q0 = seqlen - kQ;  // position of the first query token
   const int kbeg = p.left < 0 ? 0 : max(0, q0 - p.left);
@@ -165,11 +187,35 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
   const int per = ((span + kSplits * 16 - 1) / (kSplits * 16)) * 16;
   const int my0 = kbeg + split * per;
   const int my1 = min(kend, my0 + per);
+  // first load round's keys before the block (kPreKV: issued before the grid dependency wait)
+  auto issue_round = [&](int r0, int nr, int mode) {  // mode 0: every slot; 1: keys < q0 only; 2: every slot but those
+    for (int c = threadIdx.x; c < ((nr + 31) / 32) * 32 * (kD / 8); c += kThreads) {
+      const int key = c / (kD / 8), ch = c % (kD / 8);
+      const bool ok = key < nr;
+      const int jj = ok ? r0 + key : r0;
+      const bool old = ok && jj < q0;
+      if ((mode == 1 && !old) || (mode == 2 && old)) continue;
+      const int page = p.page_table[static_cast<int64_t>(req) * p.pt_stride + jj / p.page_size];
+      const int slot = jj % p.page_size;
+      const bf16_t* ks = p.k_cache + page * p.k_page_stride + slot * p.k_slot_stride + kvh * p.k_head_stride + ch * 8;
+      const bf16_t* vs = p.v_cache + page * p.v_page_stride + slot * p.v_slot_stride + kvh * p.v_head_stride + ch * 8;
+      cp_async_16(smem_u32(&sm.u.kv.k[key * kLd + ch * 8]), ks, ok);
+      cp_async_16(smem_u32(&sm.u.kv.v[key * kLd + ch * 8]), vs, ok);
+    }
+  };
+  if constexpr (kPreKV) {
+    if (my0 < my1) issue_round(my0, min(2 * kMaxHalf, my1 - my0), 1);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    device::PDLWaitPrimary<kUsePDL>();
+  }
+  // kEarlyTrigger: let the next programmatic-dependent kernel (the output projection, whose weight loads do not depend on
+  // this kernel) start now; its griddepcontrol.wait still waits for this grid's completion (PTX ISA: griddepcontrol).
+  if constexpr (kEarlyTrigger) device::PDLTriggerSecondary<kUsePDL>();
 
   // Q rows: row r = token (r / kGroup) * kGroup + head (r % kGroup) of this KV head's group
   for (int c = tid; c < kRows * (kD / 8); c += kThreads) {
     const int r = c / (kD / 8), ch = c % (kD / 8);
-    const int tok = r / kGroup, hh = r % kGroup;
+    const int tok = (row0 + r) / kGroup, hh = (row0 + r) % kGroup;
     const bf16_t* src = p.q + static_cast<int64_t>(req * kQ + tok) * p.q_row_stride +
                         static_cast<int64_t>(kvh * kGroup + hh) * p.q_head_stride + ch * 8;
     cp_async_16(smem_u32(&sm.q[r * kLd + ch * 8]), src, true);
@@ -177,7 +223,7 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
 
   // per-thread rows: g = lane / 4 and g + 8 of this warp's slice
   const int r_lo = rs * 16 + lane / 4, r_hi = r_lo + 8;
-  const int pos_lo = q0 + r_lo / kGroup, pos_hi = q0 + r_hi / kGroup;
+  const int pos_lo = q0 + (row0 + r_lo) / kGroup, pos_hi = q0 + (row0 + r_hi) / kGroup;
   const int lo_lo = p.left < 0 ? 0 : pos_lo - p.left, lo_hi = p.left < 0 ? 0 : pos_hi - p.left;
   const int hi_lo = p.right < 0 ? seqlen - 1 : pos_lo + p.right, hi_hi = p.right < 0 ? seqlen - 1 : pos_hi + p.right;
 
@@ -192,22 +238,12 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
     // one load round: up to kResident key blocks (and, in the first round, the Q rows issued above)
     const int nr = min(2 * kMaxHalf, my1 - r0);
     if (r0 != my0) __syncthreads();  // previous round's K / V reads are done
-    for (int c = tid; c < ((nr + 31) / 32) * 32 * (kD / 8); c += kThreads) {
-      const int key = c / (kD / 8), ch = c % (kD / 8);
-      const bool ok = key < nr;
-      const int jj = ok ? r0 + key : r0;
-      const int page = p.page_table[static_cast<int64_t>(req) * p.pt_stride + jj / p.page_size];
-      const int slot = jj % p.page_size;
-      const bf16_t* ks = p.k_cache + page * p.k_page_stride + slot * p.k_slot_stride + kvh * p.k_head_stride + ch * 8;
-      const bf16_t* vs = p.v_cache + page * p.v_page_stride + slot * p.v_slot_stride + kvh * p.v_head_stride + ch * 8;
-      cp_async_16(smem_u32(&sm.u.kv.k[key * kLd + ch * 8]), ks, ok);
-      cp_async_16(smem_u32(&sm.u.kv.v[key * kLd + ch * 8]), vs, ok);
-    }
+    issue_round(r0, nr, (kPreKV && r0 == my0) ? 2 : 0);
     cp_async_wait_all();
     __syncthreads();
     {
       // this warp: keys [r0 + kh * half, r0 + kh * half + half) of the round, scored in one pass
-      const int half = ((nr + 31) / 32) * 16;  // per key half, multiple of 16, <= kMaxHalf
+      const int half = ((nr + 16 * kKeyParts - 1) / (16 * kKeyParts)) * 16;  // per key part, multiple of 16, <= kMaxHalf
       const int k0 = r0 + kh * half;
       const int nk = min(half, r0 + nr - k0);  // may be <= 0
       if (nk > 0) {
@@ -312,50 +348,120 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
 
   // combine the two key halves (second half -> shared memory -> first half)
   __syncthreads();  // K / V no longer read; the union's other member is written below
-  if (kh == 1) {
-    if (lane % 4 == 0) {
-      sm.u.half.m[r_lo] = m_lo;
-      sm.u.half.m[r_hi] = m_hi;
-      sm.u.half.l[r_lo] = l_lo;
-      sm.u.half.l[r_hi] = l_hi;
+  if constexpr (kKeyParts == 2) {
+    if (kh == 1) {
+      if (lane % 4 == 0) {
+        sm.u.half.m[0][r_lo] = m_lo;
+        sm.u.half.m[0][r_hi] = m_hi;
+        sm.u.half.l[0][r_lo] = l_lo;
+        sm.u.half.l[0][r_hi] = l_hi;
+      }
+  #pragma unroll
+      for (int n = 0; n < kD / 8; ++n) {
+        const int col = n * 8 + 2 * (lane % 4);
+        *reinterpret_cast<float2*>(&sm.u.half.o[0][r_lo * kD + col]) = make_float2(o_acc[n][0], o_acc[n][1]);
+        *reinterpret_cast<float2*>(&sm.u.half.o[0][r_hi * kD + col]) = make_float2(o_acc[n][2], o_acc[n][3]);
+      }
     }
-#pragma unroll
-    for (int n = 0; n < kD / 8; ++n) {
-      const int col = n * 8 + 2 * (lane % 4);
-      *reinterpret_cast<float2*>(&sm.u.half.o[r_lo * kD + col]) = make_float2(o_acc[n][0], o_acc[n][1]);
-      *reinterpret_cast<float2*>(&sm.u.half.o[r_hi * kD + col]) = make_float2(o_acc[n][2], o_acc[n][3]);
+    __syncthreads();
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");  // every CTA of the cluster is running
+    if (kh == 0) {
+      const float m1_lo = sm.u.half.m[0][r_lo], m1_hi = sm.u.half.m[0][r_hi];
+      const float M_lo = fmaxf(m_lo, m1_lo), M_hi = fmaxf(m_hi, m1_hi);
+      const float a0_lo = M_lo == -INFINITY ? 0.f : exp2f(m_lo - M_lo), a1_lo = M_lo == -INFINITY ? 0.f : exp2f(m1_lo - M_lo);
+      const float a0_hi = M_hi == -INFINITY ? 0.f : exp2f(m_hi - M_hi), a1_hi = M_hi == -INFINITY ? 0.f : exp2f(m1_hi - M_hi);
+      const float L_lo = l_lo * a0_lo + sm.u.half.l[0][r_lo] * a1_lo;
+      const float L_hi = l_hi * a0_hi + sm.u.half.l[0][r_hi] * a1_hi;
+  #pragma unroll
+      for (int n = 0; n < kD / 8; ++n) {
+        const int col = n * 8 + 2 * (lane % 4);
+        const float2 h_lo = *reinterpret_cast<const float2*>(&sm.u.half.o[0][r_lo * kD + col]);
+        const float2 h_hi = *reinterpret_cast<const float2*>(&sm.u.half.o[0][r_hi * kD + col]);
+        // column tile n goes to CTA n (kDS == 8)
+        const uint32_t dlo = map_cta(smem_u32(&sm.ro[split][r_lo][2 * (lane % 4)]), n);
+        const uint32_t dhi = map_cta(smem_u32(&sm.ro[split][r_hi][2 * (lane % 4)]), n);
+        const float x0 = o_acc[n][0] * a0_lo + h_lo.x * a1_lo, x1 = o_acc[n][1] * a0_lo + h_lo.y * a1_lo;
+        const float x2 = o_acc[n][2] * a0_hi + h_hi.x * a1_hi, x3 = o_acc[n][3] * a0_hi + h_hi.y * a1_hi;
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dlo), "f"(x0), "f"(x1) : "memory");
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dhi), "f"(x2), "f"(x3) : "memory");
+      }
+  #pragma unroll
+      for (int c = lane % 4; c < kSplits; c += 4) {
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_lo]), c)),
+                     "f"(M_lo), "f"(L_lo)
+                     : "memory");
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_hi]), c)),
+                     "f"(M_hi), "f"(L_hi)
+                     : "memory");
+      }
     }
-  }
-  __syncthreads();
-  asm volatile("barrier.cluster.wait.aligned;" ::: "memory");  // every CTA of the cluster is running
-  if (kh == 0) {
-    const float m1_lo = sm.u.half.m[r_lo], m1_hi = sm.u.half.m[r_hi];
-    const float M_lo = fmaxf(m_lo, m1_lo), M_hi = fmaxf(m_hi, m1_hi);
-    const float a0_lo = M_lo == -INFINITY ? 0.f : exp2f(m_lo - M_lo), a1_lo = M_lo == -INFINITY ? 0.f : exp2f(m1_lo - M_lo);
-    const float a0_hi = M_hi == -INFINITY ? 0.f : exp2f(m_hi - M_hi), a1_hi = M_hi == -INFINITY ? 0.f : exp2f(m1_hi - M_hi);
-    const float L_lo = l_lo * a0_lo + sm.u.half.l[r_lo] * a1_lo;
-    const float L_hi = l_hi * a0_hi + sm.u.half.l[r_hi] * a1_hi;
-#pragma unroll
-    for (int n = 0; n < kD / 8; ++n) {
-      const int col = n * 8 + 2 * (lane % 4);
-      const float2 h_lo = *reinterpret_cast<const float2*>(&sm.u.half.o[r_lo * kD + col]);
-      const float2 h_hi = *reinterpret_cast<const float2*>(&sm.u.half.o[r_hi * kD + col]);
-      // column tile n goes to CTA n (kDS == 8)
-      const uint32_t dlo = map_cta(smem_u32(&sm.ro[split][r_lo][2 * (lane % 4)]), n);
-      const uint32_t dhi = map_cta(smem_u32(&sm.ro[split][r_hi][2 * (lane % 4)]), n);
-      const float x0 = o_acc[n][0] * a0_lo + h_lo.x * a1_lo, x1 = o_acc[n][1] * a0_lo + h_lo.y * a1_lo;
-      const float x2 = o_acc[n][2] * a0_hi + h_hi.x * a1_hi, x3 = o_acc[n][3] * a0_hi + h_hi.y * a1_hi;
-      asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dlo), "f"(x0), "f"(x1) : "memory");
-      asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dhi), "f"(x2), "f"(x3) : "memory");
+  } else {
+  if (kh >= 1) {
+      if (lane % 4 == 0) {
+        sm.u.half.m[kh - 1][r_lo] = m_lo;
+        sm.u.half.m[kh - 1][r_hi] = m_hi;
+        sm.u.half.l[kh - 1][r_lo] = l_lo;
+        sm.u.half.l[kh - 1][r_hi] = l_hi;
+      }
+  #pragma unroll
+      for (int n = 0; n < kD / 8; ++n) {
+        const int col = n * 8 + 2 * (lane % 4);
+        *reinterpret_cast<float2*>(&sm.u.half.o[kh - 1][r_lo * kD + col]) = make_float2(o_acc[n][0], o_acc[n][1]);
+        *reinterpret_cast<float2*>(&sm.u.half.o[kh - 1][r_hi * kD + col]) = make_float2(o_acc[n][2], o_acc[n][3]);
+      }
     }
-#pragma unroll
-    for (int c = lane % 4; c < kSplits; c += 4) {
-      asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_lo]), c)),
-                   "f"(M_lo), "f"(L_lo)
-                   : "memory");
-      asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_hi]), c)),
-                   "f"(M_hi), "f"(L_hi)
-                   : "memory");
+    __syncthreads();
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");  // every CTA of the cluster is running
+    if (kh == 0) {
+      float M_lo = m_lo, M_hi = m_hi;
+  #pragma unroll
+      for (int q = 0; q < kKeyParts - 1; ++q) {
+        M_lo = fmaxf(M_lo, sm.u.half.m[q][r_lo]);
+        M_hi = fmaxf(M_hi, sm.u.half.m[q][r_hi]);
+      }
+      float a_lo[kKeyParts], a_hi[kKeyParts];
+      a_lo[0] = M_lo == -INFINITY ? 0.f : exp2f(m_lo - M_lo);
+      a_hi[0] = M_hi == -INFINITY ? 0.f : exp2f(m_hi - M_hi);
+  #pragma unroll
+      for (int q = 1; q < kKeyParts; ++q) {
+        a_lo[q] = M_lo == -INFINITY ? 0.f : exp2f(sm.u.half.m[q - 1][r_lo] - M_lo);
+        a_hi[q] = M_hi == -INFINITY ? 0.f : exp2f(sm.u.half.m[q - 1][r_hi] - M_hi);
+      }
+      float L_lo = l_lo * a_lo[0], L_hi = l_hi * a_hi[0];
+  #pragma unroll
+      for (int q = 1; q < kKeyParts; ++q) {
+        L_lo = __fmaf_rn(sm.u.half.l[q - 1][r_lo], a_lo[q], L_lo);
+        L_hi = __fmaf_rn(sm.u.half.l[q - 1][r_hi], a_hi[q], L_hi);
+      }
+  #pragma unroll
+      for (int n = 0; n < kD / 8; ++n) {
+        const int col = n * 8 + 2 * (lane % 4);
+        float x0 = o_acc[n][0] * a_lo[0], x1 = o_acc[n][1] * a_lo[0];
+        float x2 = o_acc[n][2] * a_hi[0], x3 = o_acc[n][3] * a_hi[0];
+  #pragma unroll
+        for (int q = 1; q < kKeyParts; ++q) {
+          const float2 h_lo = *reinterpret_cast<const float2*>(&sm.u.half.o[q - 1][r_lo * kD + col]);
+          const float2 h_hi = *reinterpret_cast<const float2*>(&sm.u.half.o[q - 1][r_hi * kD + col]);
+          x0 = __fmaf_rn(h_lo.x, a_lo[q], x0);
+          x1 = __fmaf_rn(h_lo.y, a_lo[q], x1);
+          x2 = __fmaf_rn(h_hi.x, a_hi[q], x2);
+          x3 = __fmaf_rn(h_hi.y, a_hi[q], x3);
+        }
+        // column tile n goes to CTA n (kDS == 8)
+        const uint32_t dlo = map_cta(smem_u32(&sm.ro[split][r_lo][2 * (lane % 4)]), n);
+        const uint32_t dhi = map_cta(smem_u32(&sm.ro[split][r_hi][2 * (lane % 4)]), n);
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dlo), "f"(x0), "f"(x1) : "memory");
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(dhi), "f"(x2), "f"(x3) : "memory");
+      }
+  #pragma unroll
+      for (int c = lane % 4; c < kSplits; c += 4) {
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_lo]), c)),
+                     "f"(M_lo), "f"(L_lo)
+                     : "memory");
+        asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(map_cta(smem_u32(&sm.rml[split][r_hi]), c)),
+                     "f"(M_hi), "f"(L_hi)
+                     : "memory");
+      }
     }
   }
   cluster_sync_release_acquire();
@@ -376,7 +482,7 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
       ay += w * sm.ro[c][r][c2 + 1];
     }
     const float inv = 1.f / den;
-    const int tok = r / kGroup, hh = r % kGroup;
+    const int tok = (row0 + r) / kGroup, hh = (row0 + r) % kGroup;
     bf16_t* dst = p.out + static_cast<int64_t>(req * kQ + tok) * p.o_row_stride +
                   static_cast<int64_t>(kvh * kGroup + hh) * p.o_head_stride + split * kDS + c2;
     *reinterpret_cast<uint32_t*>(dst) = pack_bf16(ax * inv, ay * inv);
@@ -384,13 +490,14 @@ __global__ void __launch_bounds__(kThreads, 1) draft_attn_kernel(const __grid_co
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int kQ, int kGroup, int kSplits, bool kUsePDL>
+template <int kQ, int kGroup, int kSplits, bool kUsePDL, bool kEarlyTrigger = false, bool kPreKV = false,
+          int kRowSplit = 1, int kKeyParts = 2>
 struct DraftAttn {
   static void run(const tvm::ffi::TensorView q, const tvm::ffi::TensorView k_cache, const tvm::ffi::TensorView v_cache,
                   const tvm::ffi::TensorView page_table, const tvm::ffi::TensorView seqlens,
                   const tvm::ffi::TensorView out, int64_t left, int64_t right, double scale) {
     using namespace host;
-    using S = Smem<kQ, kGroup, kSplits>;
+    using S = Smem<kQ, kGroup, kSplits, kRowSplit, kKeyParts>;
     auto T = SymbolicSize{"t"};
     auto HQ = SymbolicSize{"hq"};
     auto B = SymbolicSize{"b"};
@@ -432,14 +539,15 @@ struct DraftAttn {
     p.right = static_cast<int>(right);
     p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
     const auto dev = device_.unwrap();
-    auto kernel = draft_attn_kernel<kQ, kGroup, kSplits, kUsePDL>;
+    auto kernel = draft_attn_kernel<kQ, kGroup, kSplits, kUsePDL, kEarlyTrigger, kPreKV, kRowSplit, kKeyParts>;
     static bool configured = false;
     if (!configured) {
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(S)));
       if (kSplits > 8) RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
       configured = true;
     }
-    auto lk = LaunchKernel(static_cast<unsigned>(b * kvh * kSplits), kThreads, dev, sizeof(S));
+    auto lk = LaunchKernel(static_cast<unsigned>(b * kvh * kRowSplit * kSplits), kThreadsFor<kRowSplit, kKeyParts>, dev,
+                           sizeof(S));
     lk.enable_pdl(kUsePDL);
     lk.enable_cluster(dim3(kSplits, 1, 1));
     lk(kernel, p);
