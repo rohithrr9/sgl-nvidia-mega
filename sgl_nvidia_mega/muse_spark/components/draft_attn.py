@@ -21,6 +21,13 @@ split measured faster. Draft numerics: the key range is summed in one pass inste
 merged, so the result can differ from the automatic split in the summation order (error against fp64 at most stock's,
 tests/test_draft_attn.py); it changes no other call.
 
+``MUSE_VR_DRAFT_ATTN_PRE_KV=1`` / ``MUSE_VR_DRAFT_ATTN_ROW_SPLIT=2`` (default off / 1; bit-identical variants of the kernel, see
+``ops/draft_attn``) and the key-part setting below apply to calls whose requests x KV heads is at most
+``MUSE_VR_DRAFT_ATTN_FAST_MAX_GROUPS`` (default 2); larger calls use the default kernel.
+
+``MUSE_VR_DRAFT_ATTN_KEY_PARTS=4`` (default 2; only together with the row split) selects the four-key-part kernel (another softmax / output summation order:
+draft-numerics class, error against fp64 checked by tests/test_draft_attn.py like the default kernel's).
+
 ``MUSE_VR_DRAFT_ATTN_SHADOW=1`` (debug) also runs the stock call for every eager fused call and tallies whether the two
 agree within the summation-order tolerance (bed.shadow_result).
 
@@ -178,14 +185,29 @@ def _eligible(kw: dict) -> str | None:
         return "window"
     from .ops import draft_attn as op
 
-    key = (op.use_pdl(), q.device.index)
+    pre, rows, parts = _variant(kw["cache_seqlens"].shape[0], kw["k_cache"].shape[2])
+    key = (op.use_pdl(), op.early_trigger(), pre, rows, parts, q.device.index)
     if torch.cuda.is_current_stream_capturing():
         if key not in _state["loaded"]:
             return "kernel not loaded before graph capture"
     else:
-        op.module(Q_TOKENS, 8, op.SPLITS, op.use_pdl())
+        op.module(
+            Q_TOKENS, 8, op.SPLITS, op.use_pdl(), op.early_trigger(), pre, rows, parts
+        )
         _state["loaded"].add(key)
     return None
+
+
+def _variant(requests: int, kv_heads: int):
+    """(K/V pre-load, row split, key parts) for this call: the knobs' settings while requests x KV heads stays within
+    MUSE_VR_DRAFT_ATTN_FAST_MAX_GROUPS (default 2; tunable, tests/test_draft_attn.py --bench: more groups crowd the clusters),
+    the default kernel above that. The four-key-part kernel is used only with the row split (8 warps per CTA)."""
+    from .ops import draft_attn as op
+
+    if requests * kv_heads <= bed.env_int("MUSE_VR_DRAFT_ATTN_FAST_MAX_GROUPS", 2):
+        rows = op.row_split()
+        return op.pre_kv(), rows, (op.key_parts() if rows == 2 else 2)
+    return False, 1, 2
 
 
 _POS = ("q", "k_cache", "v_cache")
@@ -227,6 +249,7 @@ def attention(original, *args, **kwargs):
         scale = q.shape[-1] ** -0.5
     win = kw.get("window_size") or (-1, -1)
     bed.count(NAME, f"fused:reqs={kw['cache_seqlens'].shape[0]}")
+    pre, rows, parts = _variant(kw["cache_seqlens"].shape[0], kw["k_cache"].shape[2])
     out = op.attention(
         q,
         kw["k_cache"],
@@ -237,6 +260,9 @@ def attention(original, *args, **kwargs):
         (int(win[0]), int(win[1])),
         Q_TOKENS,
         out=kw.get("out"),
+        pre=pre,
+        rows=rows,
+        parts=parts,
     )
     if bed.flag(NAME + "_shadow") and not torch.cuda.is_current_stream_capturing():
         # debug: the stock call on a copy of the output, compared within the summation-order tolerance (host sync)
