@@ -29,6 +29,7 @@ SGLANG_READS = {
 
 
 _CSRC = Path(__file__).resolve().parent.parent / "csrc" / "swa_verify_attn.cuh"
+_CSRC_STAGED = Path(__file__).resolve().parent.parent / "csrc" / "swa_verify_attn_d.cuh"
 
 TOKENS_PER_REQUEST = 8
 HEAD_DIM = 64
@@ -65,6 +66,92 @@ def _env_set(name: str, default: frozenset) -> frozenset:
     if raw is None:
         return default
     return frozenset(int(v) for v in raw.replace("/", ",").split(",") if v.strip())
+
+
+# Staged form (csrc/swa_verify_attn_d.cuh) of the kernel on e4m3 queries: the committed part of each block's key range is
+# copied to shared memory before the dependency wait, one block per (request, KV head) with all 64 query rows, and
+# optionally an early dependent-launch trigger. Default off.
+# MUSE_VR_SWA_VERIFY_ATTN_STAGED: request counts that take it (list separated by "," or "/"; unset or empty: none).
+# MUSE_VR_SWA_VERIFY_ATTN_STAGED_MINB: launch-bounds minimum of resident blocks per multiprocessor (default 2): one
+#   value for every request count ("1"), or per request count as "<requests>:<minimum>" pairs ("3:1,4:2"; a request
+#   count not listed takes 2).
+# MUSE_VR_SWA_VERIFY_ATTN_STAGED_EARLY: request counts that trigger dependents right after the wait (default: 3 and up).
+STAGED_CFG = (192, 4, 4)
+STAGED_MINB_DEFAULT = 2
+
+
+def staged_for(num_requests: int) -> bool:
+    return num_requests in _env_set("MUSE_VR_SWA_VERIFY_ATTN_STAGED", frozenset())
+
+
+def _staged_minb(num_requests: int) -> int:
+    raw = os.environ.get("MUSE_VR_SWA_VERIFY_ATTN_STAGED_MINB", "").strip()
+    if not raw:
+        return STAGED_MINB_DEFAULT
+    if ":" not in raw:
+        return int(raw)
+    by = {}
+    for item in raw.replace("/", ",").split(","):
+        if item.strip():
+            n, b = item.split(":")
+            by[int(n)] = int(b)
+    return by.get(num_requests, STAGED_MINB_DEFAULT)
+
+
+def _staged_early(num_requests: int) -> bool:
+    raw = os.environ.get("MUSE_VR_SWA_VERIFY_ATTN_STAGED_EARLY")
+    if raw is None:
+        return num_requests >= 3
+    return num_requests in _env_set("MUSE_VR_SWA_VERIFY_ATTN_STAGED_EARLY", frozenset())
+
+
+# MUSE_VR_SWA_VERIFY_ATTN_STAGED_FORM: "cluster" (default: the blocks of a (request, KV head) form a cluster and merge
+# through distributed shared memory) or "ticket" (no cluster: each block stores its row records to a global workspace and
+# the last block to finish merges every row, in the same order).
+def _staged_ticket() -> bool:
+    return os.environ.get("MUSE_VR_SWA_VERIFY_ATTN_STAGED_FORM", "cluster") == "ticket"
+
+
+TICKET_SLOTS, TICKET_MAX_PAIRS = (
+    64,
+    128,
+)  # layer slots; (request, KV head) pairs per call (csrc kTicket*)
+PRELOAD_SLOT = TICKET_SLOTS - 1
+_rec: dict = {}  # device index -> fp32 records workspace (grows outside graph capture)
+_tws: dict = {}  # device index -> int64 [64 * 128 + 8]: arrival words, step word, sticky error word; zero, never reset
+
+
+def _staged_ws(device, pairs: int, kc: int):
+    """(records, ticket words) of the ticket form for ``pairs`` (request, KV head) pairs; allocated outside capture."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    rec = _rec.get(idx)
+    if rec is None or rec.numel() < pairs * 64 * kc * 68 or idx not in _tws:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "swa_verify_attn staged ticket form: workspace not allocated before graph capture"
+            )
+        if rec is None or rec.numel() < pairs * 64 * kc * 68:
+            _rec[idx] = rec = torch.zeros(
+                pairs * 64 * kc * 68, dtype=torch.float32, device=device
+            )
+        if idx not in _tws:
+            _tws[idx] = torch.zeros(
+                TICKET_SLOTS * TICKET_MAX_PAIRS + 8, dtype=torch.int64, device=device
+            )
+    return rec, _tws[idx]
+
+
+def staged_step(device) -> None:
+    """Advance the ticket form's step word (one launch); the caller runs it once per step before the step's first call
+    with ``staged_slot``."""
+    rec, ws = _staged_ws(torch.device(device), 1, 11)
+    _module_staged(*STAGED_CFG, 11, 2, True, True, True).step(ws)
+
+
+def staged_error_word(device) -> int:
+    """The ticket form's sticky error word (0: none; bit 31 | bit 30 | layer slot << 16 | request bit)."""
+    _, ws = _staged_ws(torch.device(device), 1, 11)
+    return int(ws[TICKET_SLOTS * TICKET_MAX_PAIRS + 1].item()) & 0xFFFFFFFF
 
 
 def cfg(num_requests: int) -> tuple[int, int, int]:
@@ -175,6 +262,72 @@ def _module(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _module_staged(
+    kchunk: int,
+    ksplit: int,
+    krg: int,
+    kc: int,
+    minb: int,
+    early: bool,
+    norm_gate: bool,
+    ticket: bool = False,
+    exit_bar: bool = True,
+):
+    from sglang.kernels.jit.utils import load_jit, make_cpp_args
+
+    args = make_cpp_args(
+        kchunk, ksplit, krg, kc, minb, early, norm_gate, ticket, exit_bar
+    )
+    return load_jit(
+        "muse_vr_swa_verify_attn_staged",
+        *args,
+        cuda_files=[str(_CSRC_STAGED)],
+        cuda_wrappers=[
+            ("swa_verify_attn", f"muse_vr::SwaVerifyAttnStagedKernel<{args}>::run"),
+            ("attrs", f"muse_vr::SwaVerifyAttnStagedKernel<{args}>::attrs"),
+            ("step", "muse_vr::SwaStagedStep::run"),
+        ],
+    )
+
+
+def staged_key(
+    num_requests: int,
+    window_left: int,
+    norm_gate: bool = False,
+    slot: int | None = None,
+) -> tuple:
+    """The ticket form engages only for a call with a layer slot (its arrival words); else the cluster form."""
+    c, k, r = STAGED_CFG
+    return (
+        "staged",
+        c,
+        k,
+        r,
+        cluster_size(int(window_left), c),
+        _staged_minb(num_requests),
+        _staged_early(num_requests),
+        bool(norm_gate),
+        _staged_ticket() and slot is not None,
+        exit_barrier(),
+    )
+
+
+def staged_attrs(key: tuple) -> dict:
+    """Registers / shared bytes / spill bytes of the staged kernel for ``key`` (from ``staged_key``)."""
+    t = torch.zeros(8, dtype=torch.int64)
+    _module_staged(*key[1:]).attrs(t)
+    v = t.tolist()
+    return {
+        "regs": v[0],
+        "static_smem": v[1],
+        "local": v[2],
+        "max_threads": v[3],
+        "dyn_smem": v[4],
+        "threads": v[5],
+    }
+
+
 def pdl_for(num_requests: int, qk: int = 0) -> bool:
     if qk:
         no_pdl = _env_set("MUSE_VR_SWA_VERIFY_ATTN_QK_NO_PDL", _NO_PDL_REQUESTS_QK)
@@ -223,6 +376,8 @@ def module_key(
     stage: bool | None = None,
     early: bool | None = None,
 ) -> tuple:
+    if not qk and use_pdl is not False and not prefetch and staged_for(num_requests):
+        return staged_key(num_requests, window_left, norm_gate)
     c, k, r = cfg(num_requests)
     pdl = pdl_for(num_requests, qk) if use_pdl is None else use_pdl
     st = stage_for(num_requests) if stage is None else stage
@@ -271,6 +426,10 @@ def preload(
             else 0
         )
         keys.add(module_key(n, window_left, norm_gate, qk=qk or 0, rope=rope))
+        if (
+            not qk and staged_for(n) and _staged_ticket()
+        ):  # a call with a layer slot takes the ticket form
+            keys.add(staged_key(n, window_left, norm_gate, slot=PRELOAD_SLOT))
     if keys <= _loaded:
         return
     page = 64
@@ -302,25 +461,51 @@ def preload(
         TOKENS_PER_REQUEST, dtype=torch.int64, device=device
     )  # 0: no store
     for key in keys - _loaded:
-        _module(*key).swa_verify_attn(
-            q,
-            pool,
-            pool,
-            table,
-            lens,
-            out,
-            int(window_left),
-            page,
-            1.0,
-            1.0,
-            gate,
-            1e-6,
-            qkv,
-            pos,
-            cos_sin,
-            loc,
-            1e-6,
-        )
+        if key[0] == "staged":
+            rec, ws = _staged_ws(
+                torch.device(device), max_requests * num_kv_heads, key[4]
+            )
+            if key[
+                8
+            ]:  # ticket form: its own step on the preload slot, so the launch never meets a stale count
+                _module_staged(*key[1:]).step(ws)
+            _module_staged(*key[1:]).swa_verify_attn(
+                rec,
+                ws,
+                PRELOAD_SLOT,
+                q,
+                pool,
+                pool,
+                table,
+                lens,
+                out,
+                int(window_left),
+                page,
+                1.0,
+                1.0,
+                gate,
+                1e-6,
+            )
+        else:
+            _module(*key).swa_verify_attn(
+                q,
+                pool,
+                pool,
+                table,
+                lens,
+                out,
+                int(window_left),
+                page,
+                1.0,
+                1.0,
+                gate,
+                1e-6,
+                qkv,
+                pos,
+                cos_sin,
+                loc,
+                1e-6,
+            )
         _loaded.add(key)
     torch.cuda.current_stream(device).synchronize()
 
@@ -379,6 +564,7 @@ def swa_verify_attn(
     stage: bool | None = None,
     early_trigger: bool | None = None,
     kv_side: bool | None = None,
+    staged_slot: int | None = None,
 ) -> torch.Tensor:
     """Attention of 8 consecutive query tokens per request over a sliding window of a paged FP8 KV pool.
 
@@ -420,6 +606,36 @@ def swa_verify_attn(
     if out is None:
         out = torch.empty(m, hq, HEAD_DIM, dtype=torch.bfloat16, device=k_pool.device)
     reqs = m // TOKENS_PER_REQUEST
+    if (
+        qk == 0
+        and config is None
+        and use_pdl is not False
+        and not prefetch
+        and staged_for(reqs)
+    ):
+        key = staged_key(reqs, window_left, gate is not None, staged_slot)
+        _loaded.add(key)
+        rec, ws = _staged_ws(
+            k_pool.device, reqs * (k_pool.shape[1] // HEAD_DIM), key[4]
+        )
+        _module_staged(*key[1:]).swa_verify_attn(
+            rec,
+            ws,
+            int(staged_slot or 0),
+            q,
+            k_pool,
+            v_pool,
+            page_table,
+            seq_lens,
+            out,
+            int(window_left),
+            int(page_size),
+            float(bmm1_scale),
+            float(bmm2_scale),
+            gate if gate is not None else out.view(out.shape[0], -1),
+            float(norm_eps),
+        )
+        return out
     c, k, r = config or cfg(reqs)
     kc = cluster_size(int(window_left), c)
     pdl = pdl_for(reqs, qk) if use_pdl is None else use_pdl
