@@ -65,6 +65,12 @@ GLOBAL_SCALE_INV = float(
 )
 
 
+def form_l() -> bool:
+    """``MUSE_VR_MOE_LD_FORM=l``: the ``l`` MoE forms (default: the package's). Here: the MoE-LD kernel
+    builds with the ``l`` form's start-order closure (``-DMUSE_VR_MOELD_L_CLOSURE=1``, csrc/moe_ld.cuh)."""
+    return os.environ.get("MUSE_VR_MOE_LD_FORM", "").strip().lower() == "l"
+
+
 def _flashinfer_include_paths() -> list[str]:
     import flashinfer
 
@@ -91,6 +97,8 @@ def _module(n: int, slots: int, extra: tuple = ()):
     extra = extra + slot_claim.build_flags(
         "moe_ld"
     )  # exact slot claim (default) or the UNSAFE form
+    if form_l():
+        extra = extra + ("-DMUSE_VR_MOELD_L_CLOSURE=1",)
     return load_jit(
         "muse_vr_moe_ld",
         str(n),

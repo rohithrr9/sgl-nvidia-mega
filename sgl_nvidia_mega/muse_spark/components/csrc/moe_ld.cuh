@@ -53,8 +53,17 @@
 //   an atomic claim bitmap makes every slot covered exactly once per launch whatever %smid returns (the PTX ISA lets
 //   %smid change during execution); a claim that fails or a launch that ends with a slot unclaimed sets the sticky error
 //   word and traps. The previous form (slot taken directly from the SM) compiles only with -DMUSE_VR_SLOT_UNSAFE=1.
+#if MUSE_VR_MOELD_L_CLOSURE
+//   Start-order closure: the start ticket and the claim are issued by warp 0 right after its ordering edge with the previous
+//   launch of the call site (griddepcontrol.wait), never before it: a programmatic dependent may start while the previous
+//   launch's last CTA is still checking and clearing the bitmap and its tickets are still in flight.
+// Residency: grid = SM count, one CTA per SM; CTAs wait on other CTAs' FC1 tiles, so all CTAs of a launch must be
+//   resident together. Each CTA therefore takes a start ticket (one atomic increment of a per-call-site counter; warp 0, after
+//   its ordering edge: Slots above) and leaves only once every CTA of its launch has
+#else
 // Residency: grid = SM count, one CTA per SM; CTAs wait on other CTAs' FC1 tiles, so all CTAs of a launch must be
 //   resident together. Each CTA therefore takes a start ticket on entry (one atomic increment of a per-call-site counter) and leaves only once every CTA of its launch has
+#endif
 //   taken one: no CTA can start on an SM that another CTA of the same launch has already left, whatever else holds SMs
 //   when the grid launches or how early a CTA runs out of work. Tickets cycle modulo a multiple of the grid size, so a
 //   launch's tickets are one aligned block and the counter never overflows. Progress needs every CTA of the grid to start
@@ -63,9 +72,15 @@
 //   programmatic predecessors complete. It stores the packed ids, then stores the site's tag (launch index modulo the ticket
 //   cycle, plus one) to control word kBoardWord with release semantics (gpu). Warp 0 lane 0 takes this CTA's start ticket,
 //   derives the expected tag from it and polls the word with acquire loads (gpu), a bounded number of times; on a match the
+#if MUSE_VR_MOELD_L_CLOSURE
+//   ids are read with relaxed loads (gpu), otherwise the miss is counted. The ticket names the expected tag, so it cannot
+//   follow the tag's acquire: it is taken after griddepcontrol.wait (start-order closure, Slots above), and the board is read
+//   after the dependency too (no early ids in this form). The producer and this kernel must run 1:1 per site.
+#else
 //   ids are read right away with relaxed loads (gpu), otherwise after griddepcontrol.wait (the producer is then a completed
 //   predecessor) and the miss is counted. Either way the weight stream starts before the dependency wait, and every output
 //   and the token operand are written / read after it, as with flag 1. The producer and this kernel must run 1:1 per site.
+#endif
 
 #pragma once
 
@@ -113,6 +128,25 @@
 #endif
 #ifndef MUSE_VR_MOELD_MAX_POLLS
 #define MUSE_VR_MOELD_MAX_POLLS (1u << 24)
+#endif
+// 1: the start-order closure: the start ticket and the slot claim follow warp 0's ordering edge, an async-proxy fence
+// follows the dependency wait, and a CTA without consumers of the token-operand copy waits for it before it exits.
+// moe_ld_ops sets it under MUSE_VR_MOE_LD_FORM=l; 0 (default) keeps the kernel's previous ordering (every
+// MUSE_VR_MOELD_L_CLOSURE block below).
+#ifndef MUSE_VR_MOELD_L_CLOSURE
+#define MUSE_VR_MOELD_L_CLOSURE 0
+#endif
+#if MUSE_VR_MOELD_L_CLOSURE
+// Tests only (default 0): 1 = the earlier placement of the start ticket (warp 3, at entry) and of the slot claim (warp 0,
+// at entry), both before any ordering edge with the previous launch: the negative control of tests/test_moe_ld_order.py.
+#ifndef MUSE_VR_MOELD_TEST_PREWAIT_CLAIM
+#define MUSE_VR_MOELD_TEST_PREWAIT_CLAIM 0
+#endif
+// Tests only (default 0): 1 leaves out the control warp's exit wait for the token-operand copy (see the kernel), the base
+// of that wait's cost comparison.
+#ifndef MUSE_VR_MOELD_TEST_NO_TOKWAIT
+#define MUSE_VR_MOELD_TEST_NO_TOKWAIT 0
+#endif
 #endif
 
 namespace muse_vr_moeld {
@@ -173,14 +207,23 @@ constexpr int kTsfRegions = kFc2Half ? 3 : 5;  // capacity; whole tiles use one 
 constexpr uint32_t kTsfCols = (kSfa128 ? 1u : 4u) * kFc2Chunks;
 constexpr uint32_t kSfbCol = 256;    // token-operand scales, 4 columns per 64-wide K chunk ({s, 0, 0, 0}), 256 columns
 // flags
+#if MUSE_VR_MOELD_L_CLOSURE
+constexpr int kFlagIdsEarly = 1;    // id loads before griddepcontrol.wait; ticket, claim, work list after it (info arm)
+#else
 constexpr int kFlagIdsEarly = 1;    // routing prologue and weight stream before griddepcontrol.wait (info arm)
+#endif
 constexpr int kFlagEvictFirst = 2;  // L2 evict_first policy on the weight and scale copies
 constexpr int kFlagSwapDomain = 4;  // diagnostic: every CTA works on the other domain's tiles (remote weights)
 constexpr int kFlagEarlyTrigger = 8;  // A/B: launch_dependents after the prologue (default: when the grid exits)
 constexpr int kFlagL2Prefetch = 16;   // FC2 tiles: L2 prefetch of the stages that do not fit the ring
 constexpr int kFlagTailTrigger = 32;  // A/B: launch_dependents when the CTA's producer starts its last item
+#if MUSE_VR_MOELD_L_CLOSURE
+constexpr int kFlagIdsBoard = 64;     // ids-first: read the routed ids once the producer of the ids publishes them on this
+                                      // site's board (Ids board in the header); polled after griddepcontrol.wait (closure)
+#else
 constexpr int kFlagIdsBoard = 64;     // ids-first: read the routed ids once the producer of the ids publishes them on this
                                       // site's board (Ids board in the header); weight stream before griddepcontrol.wait
+#endif
 // error codes (sticky error word)
 constexpr int kErrPoll = 1, kErrMbar = 2, kErrSlot = 4, kErrStart = 8;
 // start tickets: the counter cycles over kStartCycle launches' worth of tickets (a multiple of the grid size)
@@ -316,6 +359,13 @@ __device__ __forceinline__ void fence_barrier_init() {
 __device__ __forceinline__ void fence_proxy_async_smem() {
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
+#if MUSE_VR_MOELD_L_CLOSURE
+// after griddepcontrol.wait, before asynchronous-proxy copies (tensor / bulk) of memory the predecessor grids wrote with generic
+// stores: orders those writes, made visible by the wait, before the copies (PTX ISA memory consistency model, proxies)
+__device__ __forceinline__ void fence_proxy_async_global() {
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+#endif
 __device__ __forceinline__ void named_bar_sync(uint32_t id, uint32_t n) {
   asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
 }
@@ -912,6 +962,9 @@ __device__ MUSE_VR_MOELD_ROLE void role_ctrl(Smem<kN, kS>& s, const Params& p, c
   const int lane = threadIdx.x & 31;
   if (ids_before_dependency(p.flags)) {
     grid_dep_wait();
+#if MUSE_VR_MOELD_L_CLOSURE
+    fence_proxy_async_global();  // the whole warp, before the token copies below (whichever lane elect_one() picks)
+#endif
     if (elect_one()) {
       mbar_arrive_expect_tx(&s.bfc1_full, uint32_t(kN * (kHidden / 2)));
       tma_load_3d(smem_u32(&s.b[0][0]), mB, 0, 0, 0, &s.bfc1_full);
@@ -1357,10 +1410,19 @@ __global__ void __launch_bounds__(kThreads, 1)
   __shared__ unsigned start_base;  // first ticket of this launch's block (see Residency in the header)
   if (warp == 3) {
     if (elect_one()) {
+#if MUSE_VR_MOELD_L_CLOSURE
+#if MUSE_VR_MOELD_TEST_PREWAIT_CLAIM
+      if (!board) {  // tests only (negative control): the earlier entry ticket; served: warp 0 after its ordering edge
+        const unsigned t = atomicInc(&p.ctl->reserved[kStartWord], gridDim.x * kStartCycle - 1u);
+        start_base = t - t % gridDim.x;
+      }
+#endif
+#else
       if (!board) {  // with the ids board, warp 0 takes the ticket (its launch index names the expected tag)
         const unsigned t = atomicInc(&p.ctl->reserved[kStartWord], gridDim.x * kStartCycle - 1u);
         start_base = t - t % gridDim.x;
       }
+#endif
       for (int i = 0; i < kS; ++i) {
         mbar_init(&s.full[i], 1);
         mbar_init(&s.empty[i], 1);
@@ -1393,6 +1455,9 @@ __global__ void __launch_bounds__(kThreads, 1)
     named_bar_arrive(4, 64);  // barriers initialized (warp 0 waits before its first copy)
     if (!early) {
       grid_dep_wait();
+#if MUSE_VR_MOELD_L_CLOSURE
+      fence_proxy_async_global();  // the whole warp, before the token copies below (whichever lane elect_one() picks)
+#endif
       // FC1 token operand (all tokens, full K; rows past M are zero-filled) and its block scales
       if (elect_one()) {
         mbar_arrive_expect_tx(&s.bfc1_full, uint32_t(kN * (kHidden / 2)));
@@ -1407,8 +1472,13 @@ __global__ void __launch_bounds__(kThreads, 1)
     tmem_relinquish();
     tc_fence_before();
   } else if (warp == 0) {
+#if MUSE_VR_MOELD_L_CLOSURE
+    // the routed ids and this CTA's slot: the SM's domain slot is the hint; the claim (slot_claim.cuh) is issued right after
+    // this warp's ordering edge and settled once the ids are in, so its round trip overlaps theirs
+#else
     // the routed ids and this CTA's slot: the SM's domain slot is the hint, the claim (slot_claim.cuh) is issued now and
     // settled once the ids are in, so its round trip overlaps theirs
+#endif
     unsigned slot = 0;
 #if !MUSE_VR_SLOT_UNSAFE
     unsigned* const claim_area = &p.ctl->reserved[kClaimWord];
@@ -1421,20 +1491,50 @@ __global__ void __launch_bounds__(kThreads, 1)
       unsigned smid;
       asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
       slot = unsigned(reinterpret_cast<const uint8_t*>(p.sm_domain)[smid]);  // domain << 7 | rank in the domain
+#if MUSE_VR_MOELD_L_CLOSURE
+#if !MUSE_VR_SLOT_UNSAFE && MUSE_VR_MOELD_TEST_PREWAIT_CLAIM
+      claim_old = muse_vr_slot::try_hint(claim_area, slot, p.n_dom0, p.n_dom1);  // tests only: the earlier entry claim
+#endif
+#else
 #if !MUSE_VR_SLOT_UNSAFE
       claim_old = muse_vr_slot::try_hint(claim_area, slot, p.n_dom0, p.n_dom1);
+#endif
 #endif
 #if MUSE_VR_SLOT_TRACE
       smid_claim = smid;
 #endif
     }
+#if MUSE_VR_MOELD_L_CLOSURE
+    // Start-order closure (lane 0, right after this warp's ordering edge with the previous launch of this call site:
+    // griddepcontrol.wait, i.e. that launch, its tickets and its last CTA's bitmap clear are complete): this CTA's start
+    // ticket and its slot claim. Never issued before the edge (Residency and the claim protocol both rely on it).
+    const auto start_and_claim = [&]() {
+#if MUSE_VR_MOELD_TEST_PREWAIT_CLAIM
+      if (!board) return;  // tests only: taken at entry (warp 3 / above)
+#endif
+      const unsigned t = atomicInc(&p.ctl->reserved[kStartWord], gridDim.x * kStartCycle - 1u);
+      start_base = t - t % gridDim.x;
+#if !MUSE_VR_SLOT_UNSAFE && !MUSE_VR_MOELD_TEST_PREWAIT_CLAIM
+      claim_old = muse_vr_slot::try_hint(claim_area, slot, p.n_dom0, p.n_dom1);
+#endif
+    };
+#endif
     int32_t pk[kMaxRows / 32];
     if (board) {
+#if MUSE_VR_MOELD_L_CLOSURE
+      // Ids board (header): the expected tag follows from this launch's index, so the ticket cannot follow the tag's acquire;
+      // the ticket and the claim follow griddepcontrol.wait (start-order closure), and the board is polled after it
+      grid_dep_wait();
+      unsigned got = 0;
+      if (lane == 0) {
+        start_and_claim();
+#else
       // Ids board (header): the expected tag follows from this launch's index; poll, then read the ids (relaxed, gpu)
       unsigned got = 0;
       if (lane == 0) {
         const unsigned t = atomicInc(&p.ctl->reserved[kStartWord], gridDim.x * kStartCycle - 1u);
         start_base = t - t % gridDim.x;
+#endif
         const unsigned want = start_base / gridDim.x + 1u;
 #pragma unroll 1
         for (uint32_t n = 0; n < kBoardPolls; ++n) {
@@ -1455,9 +1555,22 @@ __global__ void __launch_bounds__(kThreads, 1)
                     ? int32_t(muse_vr_ldq::ld_relaxed_gpu(reinterpret_cast<const unsigned*>(p.packed) + lane + 32 * k))
                     : 0;
     } else {
+#if MUSE_VR_MOELD_L_CLOSURE
+      if (!early) {
+        grid_dep_wait();
+        if (lane == 0) start_and_claim();
+      }
+#else
       if (!early) grid_dep_wait();
+#endif
 #pragma unroll
       for (int k = 0; k < kMaxRows / 32; ++k) pk[k] = (lane + 32 * k < m * kTopK) ? p.packed[lane + 32 * k] : 0;
+#if MUSE_VR_MOELD_L_CLOSURE
+      if (early) {  // flag 1 (info arm): the id loads above stay ahead of the dependency; the ticket and the claim follow it
+        grid_dep_wait();
+        if (lane == 0) start_and_claim();
+      }
+#endif
     }
 #pragma unroll
     for (int k = 0; k < kMaxPool / 32; ++k) s.tok_mask[lane + 32 * k] = 0u;
@@ -1658,6 +1771,14 @@ __global__ void __launch_bounds__(kThreads, 1)
         p.expert_weights[i] = uint16_t(v & 0xFFFF);
       }
     }
+#if MUSE_VR_MOELD_L_CLOSURE
+#if !MUSE_VR_MOELD_TEST_NO_TOKWAIT
+    // The FC1 token-operand copy into buffer 0 is issued in every CTA, and its consumers wait for it only when the CTA has
+    // an FC1 item (the MMA) or a second FC2 tile (the builders). A CTA with neither waits for it here, so that no CTA
+    // exits with that copy still in flight.
+    if (s.n_fc1 == 0 && s.n_items < 2) mbar_wait_idle(&s.bfc1_full, 0u, p.err);
+#endif
+#endif
   } else if (warp < 8) {
     if (early) grid_dep_wait();
     if ((p.dbg & 128) == 0) role_epilogue<kN, kS>(s, p);
