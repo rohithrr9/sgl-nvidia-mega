@@ -31,6 +31,13 @@ activation); the projections' fp32 summation order differs
 (tests/test_draft_gemv.py: error against fp64 equal to stock's). The attention's qkv and output projections keep
 SGLang's dispatch (tests/test_draft_gemv.py also times the plain GEMV against the kernels the server selects for them).
 
+``MUSE_VR_DRAFT_SPLITK=1`` (default off; only with this component; rows ``MUSE_VR_DRAFT_SPLITK_ROWS``, default 17-32,
+where the GEMV above does not engage) runs each block convolution's coefficient projection and the MLP's gate/up and
+down projections through FlashInfer's low-row BF16 GEMMs with the K reduction inside the kernel (``ops/draft_splitk``,
+one launch per projection) instead of cuBLAS's split-K kernel plus its separate reduction kernel; the input-side
+convolution, the activation and every other step stay SGLang's own code. Rounding points are the stock ones; the fp32
+summation order of the projections differs (tests/test_draft_splitk.py: error against fp64 within the stock call's).
+
 ``MUSE_VR_DRAFT_PUSH_EPI=1`` (default off; with ``MUSE_VR_DRAFT_GEMV=1`` and ``MUSE_VR_DRAFT_QK=1``) computes each layer's
 attention output projection and MLP down projection with ``ops/draft_gemv.push`` (tactics ``MUSE_VR_DRAFT_PUSH_TACTIC_O`` /
 ``MUSE_VR_DRAFT_PUSH_TACTIC_DOWN``): the GEMV pushes its output vectors into the peers' one-shot push slots and the boundary
@@ -631,7 +638,7 @@ def _push_ready(m: int, device, world: int) -> bool:
     return True
 
 
-def _prepare(conv, h, use_gemv):
+def _prepare(conv, h, use_gemv, use_sk=False):
     """The input-side convolution of ``h`` and the output-side coefficients as (base, offset, row stride)."""
     if use_gemv:
         from .ops import draft_gemv
@@ -641,7 +648,18 @@ def _prepare(conv, h, use_gemv):
         )
         groups = coef.shape[1] // 4
         return h_conv, (coef, 2 * groups, 4 * groups)
-    h_conv, kern = conv.prepare(h)
+    if use_sk:
+        # DFlashGroupedConv.prepare (pinned revision) with the coefficient projection on the split-K table's kernel:
+        # the same reshape, the same compiled input-side convolution and the same output-side coefficient view.
+        from .ops import draft_splitk
+
+        coefficients = draft_splitk.gemm(h, conv.kernel_projection.weight).reshape(
+            *h.shape[:-1], 2, conv.taps, conv.num_groups
+        )
+        h_conv = conv._convolve(h, coefficients[..., 0, :, :], side=0)
+        kern = coefficients[..., 1, :, :]
+    else:
+        h_conv, kern = conv.prepare(h)
     cv = _coef_view(kern)
     if cv is None:
         # Not the in-place layout the boundary kernel reads (e.g. not a view of one contiguous projection output):
@@ -727,6 +745,74 @@ def _gemv_ready(m: int, device) -> bool:
             draft_gemv.l2pf(epi),
             draft_gemv.conv_prefetch() and epi == draft_gemv.EPI_CONV,
         )
+    _state["loaded"].add(key)
+    return True
+
+
+def _sk_rows(m: int) -> bool:
+    lo, _, hi = os.environ.get("MUSE_VR_DRAFT_SPLITK_ROWS", "17-32").partition("-")
+    try:
+        return int(lo) <= m <= int(hi or lo)
+    except ValueError:
+        return False
+
+
+def _sk_eligible(model, m: int) -> bool:
+    """Split-K table form of the coefficient projections and the MLP projections (``MUSE_VR_DRAFT_SPLITK=1``): every
+    such projection of every layer is an unbiased contiguous bf16 weight with a table entry for ``m`` rows."""
+    if not bed.flag("draft_splitk") or not _sk_rows(m) or m % BLOCK:
+        return False
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    from .ops import draft_splitk
+
+    for ly in model.layers:
+        for conv in (ly.attention_conv, ly.mlp_conv):
+            kp = conv.kernel_projection
+            # SGLang 3117f58 + #48948: a ReplicatedLinear (was torch.nn.Linear), unquantized: x @ weight.T as before
+            if (
+                not isinstance(
+                    getattr(kp, "quant_method", None), UnquantizedLinearMethod
+                )
+                or kp.bias is not None
+                or (kp.weight.dtype != torch.bfloat16)
+                or not kp.weight.is_contiguous()
+                or (draft_splitk.tactic_for(m, *kp.weight.shape) is None)
+            ):
+                return False
+        for lin in (ly.mlp.gate_up_proj, ly.mlp.down_proj):
+            if (
+                not isinstance(lin.quant_method, UnquantizedLinearMethod)
+                or lin.bias is not None
+                or (lin.weight.dtype != torch.bfloat16)
+                or not lin.weight.is_contiguous()
+                or (draft_splitk.tactic_for(m, *lin.weight.shape) is None)
+            ):
+                return False
+    return True
+
+
+def _sk_ready(model, m: int, device) -> bool:
+    """Compile the table's kernels for ``m`` rows on an eager call (warm-up before graph capture); inside a capture only
+    report whether that has happened."""
+    key = ("splitk", m, device.index)
+    if key in _state["loaded"]:
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    from .ops import draft_splitk
+
+    ly = model.layers[0]
+    seen = set()
+    for w in (
+        ly.attention_conv.kernel_projection.weight,
+        ly.mlp.gate_up_proj.weight,
+        ly.mlp.down_proj.weight,
+    ):
+        if tuple(w.shape) in seen:
+            continue
+        seen.add(tuple(w.shape))
+        draft_splitk.gemm(torch.zeros((m, w.shape[1]), dtype=w.dtype, device=device), w)
     _state["loaded"].add(key)
     return True
 
@@ -1093,6 +1179,7 @@ def _fused_forward(
     use_qk=False,
     use_push=False,
     input_ids=None,
+    use_sk=False,
 ):
     """DFlashDraftModel.forward (pinned revision) with the layer boundaries fused. ``use_push`` (with use_gemv and use_qk):
     the row-parallel projections push their outputs; the boundaries run consumer-only. ``input_ids``: the block ids
@@ -1118,7 +1205,7 @@ def _fused_forward(
                 comm if push_o else None,
             )
         elif use_qk:
-            h_conv, coef = _prepare(layer.attention_conv, h, use_gemv)
+            h_conv, coef = _prepare(layer.attention_conv, h, use_gemv, use_sk)
             partial = _attention_qk(
                 layer.self_attn,
                 positions,
@@ -1127,7 +1214,7 @@ def _fused_forward(
                 comm if push_o else None,
             )
         else:
-            h_conv, coef = _prepare(layer.attention_conv, h, use_gemv)
+            h_conv, coef = _prepare(layer.attention_conv, h, use_gemv, use_sk)
             with _deferred_reduce(layer.self_attn.o_proj):
                 partial = layer.self_attn(
                     positions=positions,
@@ -1143,7 +1230,7 @@ def _fused_forward(
             layer.post_attention_layernorm,
             push_o,
         )
-        h_conv, coef = _prepare(layer.mlp_conv, h, use_gemv)
+        h_conv, coef = _prepare(layer.mlp_conv, h, use_gemv, use_sk)
         if use_gemv:
             from .ops import draft_gemv
 
@@ -1160,6 +1247,15 @@ def _fused_forward(
                 )
             else:
                 partial, _ = layer.mlp.down_proj(act, skip_all_reduce=True)
+        elif use_sk:
+            # DFlashMLP.forward (pinned revision) with both projections on the split-K table's kernels; the down
+            # projection's partial is what down_proj(..., skip_all_reduce=True) returns for an unbiased weight.
+            from .ops import draft_splitk
+
+            act = layer.mlp.act_fn(
+                draft_splitk.gemm(h_conv, layer.mlp.gate_up_proj.weight)
+            )
+            partial = draft_splitk.gemm(act, layer.mlp.down_proj.weight)
         else:
             with _deferred_reduce(layer.mlp.down_proj):
                 partial = layer.mlp(h_conv)
@@ -1202,6 +1298,9 @@ def draft_forward(original, model, *args, **kwargs):
         return original(model, *args, **kwargs)
     m = hidden.shape[0]
     use_gemv = _gemv_eligible(model, m) and _gemv_ready(m, hidden.device)
+    use_sk = (
+        not use_gemv and _sk_eligible(model, m) and _sk_ready(model, m, hidden.device)
+    )
     use_qk = _qk_eligible(model) and _qk_ready(hidden.device)
     use_push = (
         use_gemv
@@ -1221,9 +1320,10 @@ def draft_forward(original, model, *args, **kwargs):
     if use_qk and _dg.qk_prefetch():
         sites += ":qk_pf"
     ts = ":ts=1" if _two_shot(m, comm.world_size, _cluster_for(m)) else ""
+    sk = ":sk=1" if use_sk else ""
     bed.count(
         NAME,
-        f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}:qk={int(use_qk)}:push={int(use_push)}{sites}{ts}",
+        f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}{sk}:qk={int(use_qk)}:push={int(use_push)}{sites}{ts}",
     )
     with torch.no_grad():
         return _fused_forward(
@@ -1236,6 +1336,7 @@ def draft_forward(original, model, *args, **kwargs):
             use_qk,
             use_push,
             bound.get("input_ids"),
+            use_sk,
         )
 
 
@@ -1255,7 +1356,7 @@ def register() -> bool:
 
     HookRegistry.register(TARGET, hook, HookType.AROUND)
     from .ops import draft_ar_norm as op
-    from .ops import draft_gemv
+    from .ops import draft_gemv, draft_splitk
 
     try:
         l2pf = {
@@ -1269,6 +1370,12 @@ def register() -> bool:
     except ValueError as e:
         bed.report(NAME, False, reason=str(e))
         return False
+    # the split-K table form (its FlashInfer sources are pinned at 0.7.2, ops/draft_splitk)
+    splitk = "off"
+    if bed.flag("draft_splitk"):
+        splitk = (
+            "on" if draft_splitk.flashinfer_pinned() else "pin mismatch: flashinfer"
+        )
     ts_min = bed.env_int("MUSE_VR_DRAFT_BOUNDARY_TWO_SHOT_MIN_ROWS", 0)
     if ts_min > 0 and _one_shot_variant_set():
         ts_min = "off (a one-shot variant of the boundary is set)"
@@ -1286,6 +1393,7 @@ def register() -> bool:
         split=op.split_from_env(),
         mbarx=op.mbarx_from_env(),
         two_shot_min_rows=ts_min,
+        splitk=splitk,
     )
     if bed.flag(TABLE):
         _register_table(HookRegistry, HookType)
