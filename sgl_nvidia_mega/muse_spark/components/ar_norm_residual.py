@@ -188,7 +188,15 @@ def ar_norm_residual(
     m, hidden = partial.shape
     output = torch.empty_like(partial)
     new_stream = torch.empty_like(stream)
-    router = torch.empty_like(stream) if want_router else None
+    router = None
+    if want_router:
+        from . import router_pad
+
+        router = router_pad.router_out_for(
+            stream
+        )  # rows [0, M) of a padded buffer, or None (component off)
+        if router is None:
+            router = torch.empty_like(stream)
     if m == 0:
         return output, new_stream, router
     cluster, threads, prefetch = launch_config(

@@ -74,6 +74,7 @@ COMPONENTS = (
     "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call
     "moe_tail",
     "proj_publish",  # after moe_ld / moe_tail: rebinds the model module's pooler / unpooler call names and prepare_input
+    "router_pad",  # hooks the router's forward and the JIT boundary's router output buffer (padded router GEMM rows)
     "unorm_boundary",  # wraps FusedPostNormResidualPreNorm.forward_jit (the boundary kernel call itself)
     "fin2",
     "fin_2shot",  # after fin2 (exclusive with it): wraps the finalize op, MuseSpark1xMoE._forward_tp and its workspace setter
