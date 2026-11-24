@@ -105,8 +105,11 @@ PINS = {
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
         bed.Functions(
             {
-                "DFlashWorkerV2.__init__": "2ea464419194bb42",
-                "DFlashWorkerV2.forward_batch_generation": "d05d129bac415b00",
+                "DFlashWorkerV2.__init__": ("2ea464419194bb42", "3e9d0f4836f45469"),
+                "DFlashWorkerV2.forward_batch_generation": (
+                    "d05d129bac415b00",
+                    "513aab4e868b73a9",
+                ),
                 "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
                 "DFlashWorkerV2._take_ctx_projection": "b396aa19aff7b0b2",
             }

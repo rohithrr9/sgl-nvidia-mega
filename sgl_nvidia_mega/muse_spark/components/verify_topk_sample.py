@@ -170,6 +170,19 @@ PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        # SGLang 3117f58 + #48948 with the companion DFLASH and mixed-verify changes: the selector sample is set in
+        # _draft_block; smx's mixed pass hands the gathered verify logits to accept in _mixed_verify_running_result
+        bed.Functions(
+            {
+                "DFlashWorkerV2._can_skip_verify_logits": "44d65789838d384e",
+                "DFlashWorkerV2._accept_block": "a04a15a5ec8319b8",
+                "DFlashWorkerV2._selector_sampling_accept": "ebd8291583a59153",
+                "DFlashWorkerV2.forward_batch_generation": "513aab4e868b73a9",
+                "DFlashWorkerV2._draft_block": "d0c36d14d397e01d",
+                "DFlashWorkerV2.forward_mixed_verify_generation": "8a0eed460a7cf0a0",
+                "DFlashWorkerV2._mixed_verify_running_result": "0ede791df6525662",
+            }
+        ),
         # The hooked decision, accept and selector sampling, and the verify step that hands the logits between them.
         bed.Functions(
             {

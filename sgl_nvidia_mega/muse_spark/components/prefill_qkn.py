@@ -158,7 +158,9 @@ STORE_PINS = {
     ),
     "sglang/srt/layers/attention/base_attn_backend.py": (
         "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
-        bed.Functions({"AttentionBackend.forward": "bc5fa8fffe7afd20"}),
+        bed.Functions(
+            {"AttentionBackend.forward": ("bc5fa8fffe7afd20", "e8b4c8e2cecdcc45")}
+        ),
     ),
 }
 _store_state = {"engaged": False}
@@ -585,29 +587,38 @@ def register() -> bool:
 
     HookRegistry.register(TARGET, hook, HookType.AROUND)
     mode = "qk_norm"
+    # DFLASH mixed verify passes replay prefill graphs captured on a plain extend; their block rows leave as verify
+    # calls that take q / k normalized (smx's forms), so store (raw q / k) and q8 (e4m3 q) stay off there.
+    from . import smx
+
+    mixed = bed.enabled("smx") or smx.mixed_verify_reason() is None
     store = None
     if store_enabled():
         store_pins = all(bed.pinned(rel, sha) for rel, sha in STORE_PINS.items())
-        if store_pins:
+        if store_pins and not mixed:
             HookRegistry.register(TARGET_EXTEND, _extend_hook, HookType.AROUND)
             _store_state["engaged"] = True
             mode = "qk_norm+store"
         else:
-            store = "store pins mismatch: norm-only"
+            store = (
+                "DFLASH mixed verify: norm-only"
+                if store_pins
+                else "store pins mismatch: norm-only"
+            )
             logger.warning(
-                "muse_vr_plugin: %s store mode not engaged (pin mismatch); norm-only",
-                NAME,
+                "muse_vr_plugin: %s store mode not engaged (%s)", NAME, store
             )
     q8 = None
     if q8_enabled():
-        if all(bed.pinned(rel, sha) for rel, sha in Q8_PINS.items()):
+        q8_pins = all(bed.pinned(rel, sha) for rel, sha in Q8_PINS.items())
+        if q8_pins and not mixed:
             _q8_state["engaged"] = True
             mode += "+q8"
         else:
-            q8 = "q8 pins mismatch: bf16 q"
-            logger.warning(
-                "muse_vr_plugin: %s q8 mode not engaged (pin mismatch); bf16 q", NAME
+            q8 = (
+                "DFLASH mixed verify: bf16 q" if q8_pins else "q8 pins mismatch: bf16 q"
             )
+            logger.warning("muse_vr_plugin: %s q8 mode not engaged (%s)", NAME, q8)
     bed.report(
         NAME,
         True,

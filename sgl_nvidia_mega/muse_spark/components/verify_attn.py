@@ -193,7 +193,9 @@ PINS = {
     "sglang/srt/layers/attention/base_attn_backend.py": (
         "66803e0026f90cdeced7471ca3e28ca1949229f06e6e627450f5a2598f4b1de8",
         "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
-        bed.Functions({"AttentionBackend.forward": "bc5fa8fffe7afd20"}),
+        bed.Functions(
+            {"AttentionBackend.forward": ("bc5fa8fffe7afd20", "e8b4c8e2cecdcc45")}
+        ),
     ),
     "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
         "99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67",

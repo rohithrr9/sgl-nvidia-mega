@@ -1415,6 +1415,23 @@ WORKER_MODULE = "sglang.srt.speculative.dflash_worker_v2"
 TABLE_PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "93214d7935961f620475e85e14b418ae9054b84c9a549c1ea62720cdd7088c5d",
+        # SGLang 3117f58 + #48948 with the DFLASH one-launch steps and smx: the draft block in _draft_block, its block
+        # prep and noise embedding (fused prep and row gather) and the block-ids buffer it shares with the tokens
+        bed.Functions(
+            {
+                "DFlashWorkerV2.__init__": "3e9d0f4836f45469",
+                "DFlashWorkerV2.forward_batch_generation": "513aab4e868b73a9",
+                "DFlashWorkerV2._draft_block": "d0c36d14d397e01d",
+                "DFlashWorkerV2._ensure_draft_block_buffers": "ca69c07aaacb20cb",
+                "DFlashWorkerV2._assemble_draft_tokens": "26591470acb4b263",
+                "DFlashWorkerV2._take_bonus_tokens_source": "0bfeae9dd4dc39b4",
+                "DFlashWorkerV2._prepare_block_from_relay": "3851221d05f3cc53",
+                "DFlashWorkerV2._resolve_fork_prep_embedding": "ea69b160a5feaed4",
+                "DFlashWorkerV2._cache_full_embed_weight": "53064fe81670a31d",
+                "DFlashWorkerV2._maybe_merge_trained_mask_embedding": "829b9547bdce5991",
+                "_resolve_dflash_embedding_module": "8ef751c52d1af753",
+            }
+        ),
         # SGLang 3117f58 + #48948: the hooked constructor (mask id, noise scale, merged mask embedding, full embedding)
         # and the decode step's draft block [bonus, mask x 7], noise embedding and input_ids = the block ids
         bed.Functions(
@@ -1430,6 +1447,15 @@ TABLE_PINS = {
     ),
     # the worker's block preparation kernel (block ids [bonus, mask x 7])
     "sglang/kernels/ops/speculative/dflash.py": (
+        # SGLang with the DFLASH one-launch steps: their fused fork prep writes the same block rows
+        bed.Functions(
+            {
+                "_prepare_dflash_draft_block_contig_kernel": "f6a34785ab284005",
+                "_prepare_dflash_draft_block_unchecked": "f44959c2dfca8c13",
+                "_dflash_fork_prep_kernel": "df82ddc3bfc4d0bd",
+                "prepare_dflash_draft_block_from_relay": "1938cc7216b41383",
+            }
+        ),
         bed.Functions(
             {
                 "_prepare_dflash_draft_block_contig_kernel": "f6a34785ab284005",
@@ -1444,7 +1470,10 @@ TABLE_PINS = {
         bed.Functions(
             {
                 "DecodeCudaGraphRunner.capture_prepare": "cf79b26a7e364330",
-                "DecodeCudaGraphRunner.load_batch": "1abbb00f4fe21390",
+                "DecodeCudaGraphRunner.load_batch": (
+                    "1abbb00f4fe21390",
+                    "acedc9081e170015",
+                ),
                 "DecodeCudaGraphRunner._copy_replay_inputs": "456a6dabf918d3ca",
                 "DecodeCudaGraphRunner._restage_is_redundant": "dec44ec98197e40e",
                 "build_replay_fb_view": "cf1aefeb488d6e56",
@@ -1455,7 +1484,10 @@ TABLE_PINS = {
         "81431f2d2ca2f36b9a1d80d011774bc6b707674f846cc93f65d380131593b6e2",
         bed.Functions(
             {
-                "CudaGraphBufferRegistry.fill_from": "c9035f9bfc7f75df",
+                "CudaGraphBufferRegistry.fill_from": (
+                    "c9035f9bfc7f75df",
+                    "61094745cb70ad59",
+                ),
                 "_grouped_foreach_copy_": "7d6a947e5855c14b",
             }
         ),

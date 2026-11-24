@@ -89,6 +89,23 @@ T_APPEND = "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._append_targe
 # the layer router (the index translator's successors), the HiCache sidecar builder and the draft's window convention.
 PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
+        # SGLang 3117f58 + #48948 with the DFLASH one-launch steps and smx: the draft block and its plan bind in
+        # _draft_block; smx's mixed pass writes draft KV in _mixed_verify_extend_result and _mixed_verify_running_result
+        bed.Functions(
+            {
+                "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
+                "DFlashWorkerV2._draft_write_ids": "bd6b4184c0c2e851",
+                "DFlashWorkerV2._append_target_hidden_decode": "3e8ed52bddd81088",
+                "DFlashWorkerV2._append_target_hidden_sequential": "c0f175a24ed32573",
+                "DFlashWorkerV2._append_target_hidden_fused": "c40ffaf1f6f3074f",
+                "DFlashWorkerV2._draft_kv_full_to_swa_mapping": "8b88568d70254f56",
+                "DFlashWorkerV2.forward_batch_generation": "513aab4e868b73a9",
+                "DFlashWorkerV2._draft_block": "d0c36d14d397e01d",
+                "DFlashWorkerV2.forward_mixed_verify_generation": "8a0eed460a7cf0a0",
+                "DFlashWorkerV2._mixed_verify_extend_result": "1e8068b5d304a582",
+                "DFlashWorkerV2._mixed_verify_running_result": "0ede791df6525662",
+            }
+        ),
         bed.Functions(
             {
                 "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
@@ -227,7 +244,10 @@ PINS = {
                 "FlashAttentionBackend.forward_decode": "d6c4b0eea2d64858",
                 "FlashAttentionBackend.init_cuda_graph_state": "1ee66c94c05cdda5",
                 "FlashAttentionBackend._bind_metadata_buffers": "1f4d871f060bfebb",
-                "FlashAttentionBackend._set_decode_page_metadata": "78fcc4ffc9e20462",
+                "FlashAttentionBackend._set_decode_page_metadata": (
+                    "78fcc4ffc9e20462",
+                    "71bd15b7241803ab",
+                ),
                 "FlashAttentionBackend._apply_cuda_graph_metadata": "22db4bd7601e038a",
                 "FlashAttentionBackend._init_sliding_window_attn_spec_metadata": "94e6d4ea5504df4d",
             }

@@ -57,10 +57,12 @@ PINS = {
                 "_SelectorDraftSampler.__call__": (
                     "01c164b1ef53ea15",
                     "abf871e91cf76cbd",
+                    "b666293d6504be8c",
                 ),
                 "_SelectorDraftSampler.__init__": (
                     "bc029f9f317dd92e",
                     "c046cc84f70f407f",
+                    "6adef116af77e7d1",
                 ),
                 "_selector_lattice": "5778979618f841b9",
             }
