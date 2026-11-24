@@ -65,6 +65,8 @@ constexpr int kBV = 4096;
 constexpr int kMaxK = 64;
 constexpr int kMaxSlots = 16;
 constexpr int kMaxTiles = 64;
+constexpr int kLevels = 12;  // levels of the per-tile reduction tree
+static_assert(kBV == 1 << kLevels, "one tree level per key bit of a tile element");
 
 struct Params {
   int32_t* predicts;
@@ -87,6 +89,8 @@ struct Params {
   int K, KQ, slots, vocab, tiles;
   unsigned long long seed, off_a, off_b;  // draw = 1: generator seed, offsets of the two draws
   int draw;
+  int level_merge;  // 1: the tile sums' sibling merge runs level by level in one warp (same tree, same sums); 2: tests
+                    // only (levels top down, wrong sums)
 };
 
 // One torch.rand element (float32, [0, 1)) for a draw at `offset`: see the header note above.
@@ -274,7 +278,7 @@ __global__ void __launch_bounds__(kThreads, 1) sparse_final_kernel(const __grid_
   int n = 0;
 #pragma unroll
   for (int w = 0; w < kThreads / 32; ++w) n += s.wcount[w];
-  {
+  if (!p.level_merge) {
     const int j = th;
     bool start = false;
     float root = 0.0f;
@@ -320,9 +324,55 @@ __global__ void __launch_bounds__(kThreads, 1) sparse_final_kernel(const __grid_
       for (int w = 0; w < kThreads / 32; ++w) tot += s.wcount2[w];
       s.nodes = tot;
     }
+  } else if (warp == 0) {
+    // Level by level (level_merge = 1): at level L the stock tree adds the two nodes whose keys agree above bit L (one
+    // with bit L clear, one with it set, adjacent in key order); a node without such a sibling is carried up unchanged
+    // (x + 0 = x for x >= +0). Lower levels are merged first, so each pair holds the stock tree's two subtree sums, and
+    // the addition commutes: every tile sum is the one of the merge above, bit for bit. Every tile is merged at once;
+    // the work does not grow with the number of leaves in one tile. Nodes j = lane and lane + 32 (n <= K <= 64).
+    int cnt = n;
+#pragma unroll 1
+    for (int step = 0; step < kLevels; ++step) {
+      // level_merge = 2 walks the levels top down: a deliberately wrong tree that exists only so tests can show the
+      // bitwise comparisons detect a merge in the wrong order
+      const int L = p.level_merge == 2 ? kLevels - 1 - step : step;
+      bool keep[2] = {false, false};
+      uint32_t nk[2] = {0u, 0u};
+      float nv[2] = {0.0f, 0.0f};
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int j = lane + 32 * h;
+        if (j < cnt) {
+          const uint32_t kj = s.key[j], g = kj >> (L + 1);
+          const bool is_right = j > 0 && (s.key[j - 1] >> (L + 1)) == g;
+          const bool has_right = j + 1 < cnt && (s.key[j + 1] >> (L + 1)) == g;
+          keep[h] = !is_right;
+          nk[h] = kj;
+          nv[h] = has_right ? __fadd_rn(s.val[j], s.val[j + 1]) : s.val[j];
+        }
+      }
+      const uint32_t m0 = __ballot_sync(0xffffffffu, keep[0]), m1 = __ballot_sync(0xffffffffu, keep[1]);
+      const uint32_t below = (1u << lane) - 1u;
+      __syncwarp();  // every read of this level is done before any node moves
+      if (keep[0]) {
+        const int d = __popc(m0 & below);
+        s.key[d] = nk[0];
+        s.val[d] = nv[0];
+      }
+      if (keep[1]) {
+        const int d = __popc(m0) + __popc(m1 & below);
+        s.key[d] = nk[1];
+        s.val[d] = nv[1];
+      }
+      cnt = __popc(m0) + __popc(m1);
+      __syncwarp();
+    }
+    // one node per tile is left, in tile order; keep only the tile bits of its key (as the merge above does)
+    for (int j = lane; j < cnt; j += 32) s.key[j] = (s.key[j] >> 12) << 12;
+    if (lane == 0) s.nodes = cnt;
   }
   __syncthreads();
-  if (th < s.nodes) {
+  if (!p.level_merge && th < s.nodes) {
     s.key[th] = s.rkey[th];
     s.val[th] = s.rval[th];
   }
@@ -478,7 +528,7 @@ struct SparseFinal {
                   const tvm::ffi::TensorView top_probs, const tvm::ffi::TensorView top_ids,
                   const tvm::ffi::TensorView cand_ids, const tvm::ffi::TensorView q_rows,
                   const tvm::ffi::TensorView uniform_final, const tvm::ffi::TensorView bonus, int64_t vocab,
-                  int64_t draw, int64_t seed, int64_t off_a, int64_t off_b) {
+                  int64_t draw, int64_t seed, int64_t off_a, int64_t off_b, int64_t level_merge) {
     using namespace host;
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
@@ -549,6 +599,8 @@ struct SparseFinal {
     p.seed = static_cast<unsigned long long>(seed);
     p.off_a = static_cast<unsigned long long>(off_a);
     p.off_b = static_cast<unsigned long long>(off_b);
+    RuntimeCheck(level_merge >= 0 && level_merge <= 2, "level_merge: 0 off, 1 on, 2 the wrong-order test form");
+    p.level_merge = static_cast<int>(level_merge);
     const auto dev = device_.unwrap();
     const auto code = q_rows.dtype().code;
     const auto bits = q_rows.dtype().bits;

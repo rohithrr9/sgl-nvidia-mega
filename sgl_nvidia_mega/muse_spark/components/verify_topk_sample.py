@@ -53,6 +53,9 @@ generator's seed and offsets are read and advanced on the host exactly as the tw
 them, at the same point of the step, and each element is computed as ``torch.rand``'s kernel computes it at these sizes
 (csrc/sparse_final.cuh). Eager calls only; under CUDA-graph capture, for draws too large for that element mapping, or
 when the fused kernel does not take the call, ``torch.rand`` runs as before (each decision is counted).
+``MUSE_VR_SPARSE_FINAL_LEVEL_MERGE=1`` (default off; with ``MUSE_VR_SPARSE_FINAL=1``): that kernel merges the tile sums'
+leaves level by level in one warp instead of one thread per tile, so its time no longer grows with the number of top-k
+ids that fall in one tile; same tree, same sums, same bits.
 
 Engaged only when every request samples with the same ``top_k`` in [2, 64], ``top_p`` 1, no penalties, logit bias,
 custom logit processor, grammar, logprobs or sampling-mask capture, the selector path without block verification,
@@ -1110,6 +1113,7 @@ def sparse_chain_sample(
     bonus=None,
     fused=None,
     coins_rng=None,
+    level_merge=None,
 ):
     """Same writes to predicts / accept_index / accept_token_num as ``chain_speculative_sampling_triton`` (non-block
     verification) on the dense matrices that hold top_probs at top_ids (target) and q_rows at cand_ids (draft); with
@@ -1117,7 +1121,9 @@ def sparse_chain_sample(
     walk and the final-token pass as one CUDA kernel (csrc/sparse_final.cuh; same writes, same bits); None = from
     ``MUSE_VR_SPARSE_FINAL`` (default off). ``coins_rng`` = (seed, offset of the first draw, offset of the second) from
     ``_reserve_coins``: the kernel draws ``uniform_samples`` / ``uniform_samples_final`` itself (the buffers are
-    written); the caller has checked that the fused kernel takes the call (``_coins_ok``)."""
+    written); the caller has checked that the fused kernel takes the call (``_coins_ok``). ``level_merge``: the fused
+    kernel's level-by-level tile-sum merge (same bits); None = from ``MUSE_VR_SPARSE_FINAL_LEVEL_MERGE`` (default off);
+    the integer 2 is a test-only wrong-order form (csrc/sparse_final.cuh)."""
     bs, num_slots = candidates.shape
     k = top_ids.shape[1]
     kq = cand_ids.shape[-1]
@@ -1150,6 +1156,8 @@ def sparse_chain_sample(
         draw, seed, off_a, off_b = (
             (1, *coins_rng) if coins_rng is not None else (0, 0, 0, 0)
         )
+        if level_merge is None:
+            level_merge = bed.flag("sparse_final_level_merge")
         sf_module().run(
             predicts,
             accept_index,
@@ -1168,11 +1176,14 @@ def sparse_chain_sample(
             _signed64(seed),
             off_a,
             off_b,
+            int(level_merge),
         )
         if not torch.cuda.is_current_stream_capturing() and not _state.get(
             "in_preload"
         ):
             bed.count("sparse_final", "fused")
+            if level_merge:
+                bed.count("sparse_final", "level_merge")
         return bonus
     sc = _scratch(dev, bs, vocab)
     zero, arrived, tile_sums, result, meta = (
@@ -1635,7 +1646,14 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
             bed.flag("sparse_final"),
         )
         info = dict(
-            k=k, kq=kq, block=block, cols=cols, fast=fast, pull=pull, fused=fused
+            k=k,
+            kq=kq,
+            block=block,
+            cols=cols,
+            fast=fast,
+            pull=pull,
+            fused=fused,
+            level_merge=bool(fused and bed.flag("sparse_final_level_merge")),
         )
         _state["in_preload"] = True
         # collective set-up first: every rank reaches this point on the same step with the same k and settings
