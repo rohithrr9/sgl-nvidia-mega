@@ -295,7 +295,13 @@ def register() -> bool:
         finally:
             _tls.layer = prev
 
-    _state["min_m"] = max(17, bed.env_int("MUSE_VR_BF16_LDW_MIN", 64))
+    from .moe_ld_ops import form_l
+
+    # Floor 1 under MUSE_VR_MOE_LD_FORM=l (17 otherwise): verify batches of 8 / 16 rows can take the kernel when
+    # MUSE_VR_BF16_LDW_MIN asks for them; the kernel's rows are bitwise to FlashInfer at 1 / 8 / 16 / 17 rows.
+    _state["min_m"] = max(
+        1 if form_l() else 17, bed.env_int("MUSE_VR_BF16_LDW_MIN", 64)
+    )
     _state["orig"] = ffm.trtllm_bf16_routed_moe
     ffm.trtllm_bf16_routed_moe = _routed
     cls.prepare_trtllm_weights = prepare_trtllm_weights

@@ -875,6 +875,13 @@ def _early_register(HookRegistry=None, HookType=None) -> bool:
 
 
 def register() -> bool:
+    from .moe_ld_ops import form_l
+
+    # MUSE_VR_MOE_LD_FORM=l: the MoE-LD-W family of moe_ld_l serves instead (one MoE form per process)
+    if form_l():
+        from . import moe_ld_l
+
+        return moe_ld_l.register()
     if _state["engaged"] is not None:
         return _state["engaged"]
     if not bed.enabled(NAME):
