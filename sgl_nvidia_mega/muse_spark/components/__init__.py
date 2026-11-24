@@ -74,6 +74,7 @@ COMPONENTS = (
     "kv4_dec",  # after verify_attn: its hook wraps verify_attn's
     "moe_ld",  # before moe_tail: wraps the experts' forward and the routed-MoE call
     "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call
+    "ringbal",  # after moe_ld: wraps its weight preparation (80-slot layers for its MoE-LD-W calls)
     "moe_tail",
     "proj_publish",  # after moe_ld / moe_tail: rebinds the model module's pooler / unpooler call names and prepare_input
     "router_pad",  # hooks the router's forward and the JIT boundary's router output buffer (padded router GEMM rows)
