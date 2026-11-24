@@ -76,6 +76,7 @@ COMPONENTS = (
     "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call
     "ringbal",  # after moe_ld: wraps its weight preparation (80-slot layers for its MoE-LD-W calls)
     "moe_tail",
+    "pooler_splitk",  # before proj_publish: that hook keeps the pooler rows it publishes and hands the others to this one
     "proj_publish",  # after moe_ld / moe_tail: rebinds the model module's pooler / unpooler call names and prepare_input
     "router_pad",  # hooks the router's forward and the JIT boundary's router output buffer (padded router GEMM rows)
     "unorm_boundary",  # wraps FusedPostNormResidualPreNorm.forward_jit (the boundary kernel call itself)
