@@ -78,10 +78,26 @@ def module(
     consumer_only: bool = False,
     mc_push: bool = False,
     mbarx: bool = False,
+    two_shot: bool = False,
 ):
+    """``two_shot``: the column-slice reduce + gather exchange (see the .cuh header); its own JIT module."""
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    if mbarx:
+    # kTwoShot follows the #76 variant flags in the launcher's template list
+    if two_shot:
+        args = make_cpp_args(
+            hidden,
+            world,
+            cluster,
+            pdl,
+            poll_all,
+            early_trigger,
+            consumer_only,
+            mc_push,
+            mbarx,
+            True,
+        )
+    elif mbarx:
         args = make_cpp_args(
             hidden,
             world,
@@ -106,7 +122,7 @@ def module(
     else:
         args = make_cpp_args(hidden, world, cluster, pdl)
     return load_jit(
-        "muse_vr_draft_ar_norm",
+        "muse_vr_draft_ar_norm" + ("_two_shot" if two_shot else ""),
         *args,
         cuda_files=[str(_CSRC)],
         cuda_wrappers=[
@@ -165,12 +181,14 @@ def run(
     split=None,
     mbarx=None,
     producer_mc=False,
+    two_shot=False,
 ):
     """All-reduce ``partial`` over the communicator's push plane and apply the boundary; updates ``residual`` in place
     and returns the normalized rows. ``poll_all`` / ``early_trigger``: None = from the environment. ``consumer_only``: the
     partial's vectors were already pushed by the producing GEMV (``ops.draft_gemv.push``); this call does not push them.
     ``producer_mc`` (with consumer_only): that GEMV stored them through the multicast address, so this rank's own slot was
-    written too and is polled and scrubbed (the kernel's kMcPush form, without its push)."""
+    written too and is polled and scrubbed (the kernel's kMcPush form, without its push).
+    ``two_shot``: the column-slice reduce + gather exchange."""
     hidden = partial.shape[-1]
     if out is None:
         out = torch.empty_like(partial)
@@ -194,7 +212,7 @@ def run(
         split = (
             0  # the previous-row copies would not fit the push slot: the plain kernel
         )
-    if split and not poll_all and not consumer_only:
+    if split and not poll_all and not consumer_only and not two_shot:
         split_module(
             hidden,
             comm.world_size,
@@ -228,6 +246,7 @@ def run(
         bool(consumer_only),
         bool(mc_push),
         bool(mbarx),
+        bool(two_shot),
     ).run(
         comm.obj,
         partial,

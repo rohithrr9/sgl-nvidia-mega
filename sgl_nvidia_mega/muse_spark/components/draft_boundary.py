@@ -99,6 +99,14 @@ sequence-parallel or reduce override is active, the push slot holds the rows and
 launch width. The decision depends only on facts every rank shares,
 so all ranks take the same path. Kernels are built and loaded on the first eager call (warm-up before graph capture);
 a capture that finds them unloaded runs the stock forward.
+
+``MUSE_VR_DRAFT_BOUNDARY_TWO_SHOT_MIN_ROWS`` (default 0 = off): forwards of at least this many rows exchange the
+partials in the two-shot column-slice form (``csrc/draft_ar_norm.cuh``): each rank reduces and convolves the columns it
+owns and sends the result to every rank. The values are the one-shot form's up to the sign of a zero, given that the
+replicated inputs (residual, convolution coefficients and base kernel) are equal on every rank, as tensor parallelism
+keeps them: a column slice is convolved on its owner rank only.
+It stays off while a one-shot variant of the boundary is set (``MUSE_VR_DRAFT_ARN_POLL_ALL`` / ``_EARLY_TRIGGER`` /
+``_MC`` / ``_SPLIT`` / ``_MBARX``, ``MUSE_VR_DRAFT_PUSH_EPI``): the two were never combined.
 """
 
 from __future__ import annotations
@@ -344,6 +352,27 @@ def _reduce_group(linear):
     return get_parallel().tp_group
 
 
+@functools.lru_cache(maxsize=None)
+def _one_shot_variant_set() -> bool:
+    """A one-shot variant of the boundary is set (``MUSE_VR_DRAFT_ARN_*``, the consumer-only ``MUSE_VR_DRAFT_PUSH_EPI``):
+    the two-shot form stays off (the kernel is not built with them)."""
+    from .ops import draft_ar_norm as op
+
+    return bool(
+        op.poll_all_from_env()
+        or op.early_trigger_from_env()
+        or op.mc_push_from_env()
+        or op.split_from_env()
+        or op.mbarx_from_env()
+        or bed.flag("draft_push_epi")
+    )
+
+
+def _two_shot(rows: int, world: int, cluster: int) -> bool:
+    lo = bed.env_int("MUSE_VR_DRAFT_BOUNDARY_TWO_SHOT_MIN_ROWS", 0)
+    return lo > 0 and rows >= lo and not _one_shot_variant_set()
+
+
 def _model_eligible(model, hidden: torch.Tensor):
     """(reason, context) for one draft forward."""
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -413,11 +442,13 @@ def _model_eligible(model, hidden: torch.Tensor):
         comm._max_push_size
     ):
         split = 0  # the previous-row copies would not fit the slot: the plain kernel (as op.run decides the same way)
+    two_shot = _two_shot(m, group.world_size, cluster)
     key = (
         hdim,
         group.world_size,
         op.use_pdl(),
         cluster,
+        two_shot,
         op.poll_all_from_env(),
         op.early_trigger_from_env(),
         op.mc_push_from_env(),
@@ -439,6 +470,7 @@ def _model_eligible(model, hidden: torch.Tensor):
             False,
             op.mc_push_from_env(),
             op.mbarx_from_env(),
+            two_shot,
         )
         if split:
             op.split_module(
@@ -467,6 +499,12 @@ def _coef_view(kern: torch.Tensor):
     return base, kern.storage_offset() - base.storage_offset(), kern.stride(0)
 
 
+def _cluster_for(rows: int) -> int:
+    from .ops import draft_ar_norm as op
+
+    return op.cluster_for(rows)
+
+
 def _boundary(comm, partial, coef, conv, residual, norm, consumer_only=False):
     """``coef``: (base tensor, element offset of the output-side coefficients, row stride). ``consumer_only``: the partial's
     vectors were pushed by the producing GEMV (``ops/draft_gemv.push``)."""
@@ -474,6 +512,8 @@ def _boundary(comm, partial, coef, conv, residual, norm, consumer_only=False):
     from .ops import draft_gemv
 
     base, off, stride = coef
+    m = partial.shape[0]
+    cluster = op.cluster_for(m)
     return op.run(
         comm,
         partial,
@@ -484,6 +524,8 @@ def _boundary(comm, partial, coef, conv, residual, norm, consumer_only=False):
         residual,
         norm.weight,
         norm.variance_epsilon,
+        cluster=cluster,
+        two_shot=_two_shot(m, comm.world_size, cluster),
         consumer_only=consumer_only,
         producer_mc=consumer_only and draft_gemv.push_mc(),
     )
@@ -583,6 +625,7 @@ def _push_ready(m: int, device, world: int) -> bool:
         True,
         mc,
         op.mbarx_from_env(),
+        False,
     )
     _state["loaded"].add(key)
     return True
@@ -1177,9 +1220,10 @@ def draft_forward(original, model, *args, **kwargs):
         sites += ":conv_pf"
     if use_qk and _dg.qk_prefetch():
         sites += ":qk_pf"
+    ts = ":ts=1" if _two_shot(m, comm.world_size, _cluster_for(m)) else ""
     bed.count(
         NAME,
-        f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}:qk={int(use_qk)}:push={int(use_push)}{sites}",
+        f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}:qk={int(use_qk)}:push={int(use_push)}{sites}{ts}",
     )
     with torch.no_grad():
         return _fused_forward(
@@ -1225,6 +1269,9 @@ def register() -> bool:
     except ValueError as e:
         bed.report(NAME, False, reason=str(e))
         return False
+    ts_min = bed.env_int("MUSE_VR_DRAFT_BOUNDARY_TWO_SHOT_MIN_ROWS", 0)
+    if ts_min > 0 and _one_shot_variant_set():
+        ts_min = "off (a one-shot variant of the boundary is set)"
     bed.report(
         NAME,
         True,
@@ -1238,6 +1285,7 @@ def register() -> bool:
         mc_push=op.mc_push_from_env(),
         split=op.split_from_env(),
         mbarx=op.mbarx_from_env(),
+        two_shot_min_rows=ts_min,
     )
     if bed.flag(TABLE):
         _register_table(HookRegistry, HookType)

@@ -33,6 +33,13 @@
 // CTA. The CTA that pushes a vector is the CTA that consumes it on every rank. Row sums of squares are exchanged
 // through distributed shared memory after a cluster barrier (arrive.release / wait.acquire).
 //
+// Two-shot form (template flag kTwoShot, default off): the exchange is split into a reduce step and a gather step in
+// the column-slice layout of SGLang pull request 47174's two-shot push all-reduce (Apache-2.0): each rank owns
+// kHidden / kWorld of the columns (an equal share of every CTA's column vectors); partials go to the owner of their
+// columns, the owner reduces them in the arithmetic above, applies the output-side convolution and sends y to every
+// rank, and every rank adds the residual and normalizes as above. Each CTA then moves half the bytes of the one-shot
+// exchange (world 4) at the cost of a second hop.
+//
 // kPollAll: the peers' slots are read all at once and only the slots still empty are read again (default: one slot after
 // the other). Same values, same arithmetic; the outputs are bit-identical (tests/dist_draft_boundary.py).
 //
@@ -191,12 +198,15 @@ SGL_DEVICE void st_multimem_relaxed_16B(const uint4& v, uint8_t* mc_base, uint32
 }
 
 template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL, bool kLoopback, bool kPollAll = false,
-          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false>
+          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false,
+          bool kTwoShot = false>
 __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_constant__ Params<kWorld> params) {
   constexpr uint32_t kSlice = kHidden / kCluster;  // columns per CTA
   constexpr uint32_t kVecsPerThread = kSlice / (32 * 8);
   constexpr uint32_t kGroups = kHidden / 16;
   static_assert(kSlice % 256 == 0 && kVecsPerThread >= 1, "slice must be whole warp-wide vector rows");
+  static_assert(!kTwoShot || !(kPollAll || kEarlyTrigger || kConsumerOnly || kMcPush || kMbarX),
+                "two-shot: built without the one-shot variants (draft_boundary keeps it off when one is set)");
   constexpr uint32_t kRowVecs = kHidden / 8;
 
   __shared__ uint16_t xs[kBlock][kSlice];
@@ -237,6 +247,153 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   const uint32_t row = req * kBlock + t;
   // later request blocks: this CTA's reads of the previous `part` are ordered before the peers' next stores into it
   if (req != blockIdx.x / kCluster) cluster_arrive_release();
+  float h[kVecsPerThread][8];
+  float ss = 0.0f;
+  if constexpr (kTwoShot && !kLoopback) {
+    // Two-shot exchange (the column-slice form of SGLang PR 47174's push all-reduce, on the same plane and protocol). Every
+    // thread's 16-byte column vectors are dealt to the ranks in equal shares (vector q = v * 32 + lane of the CTA belongs to
+    // rank q / (kQ / kWorld)), so every CTA owns 1 / kWorld of its columns on every rank. A thread pushes the partials of the
+    // vectors it does not own to their owners, sums the vectors it owns over all ranks in rank order in fp32 with one bf16
+    // rounding (the one-shot arithmetic), applies the output-side convolution to them (the row above is the same thread
+    // position of the previous warp, on the same rank) and pushes y to every rank; it then receives y for the vectors it
+    // does not own. Both directions use the one-shot slot layout: a (destination, source) slot carries the source's partials
+    // at vectors the destination owns and the source's y at vectors the source owns, so the two never overlap. Per element
+    // the values are the one-shot kernel's, except that a 32-bit word of two +0.0 in y is sent as (+0.0, -0.0) (the
+    // protocol's encoding) and every rank, the owner included, adds that encoded y: the residual and output can then differ
+    // from the one-shot form in the sign of a zero only.
+    constexpr uint32_t kQ = kVecsPerThread * 32;  // 16-byte column vectors per CTA row
+    static_assert(kQ % kWorld == 0, "two-shot: equal shares of the CTA's column vectors");
+    constexpr uint32_t kPer = kQ / kWorld;
+    uint4 own[kVecsPerThread];
+    uint4 res4[kVecsPerThread];
+    uint4 y4[kVecsPerThread];
+    float d0[kVecsPerThread], d1[kVecsPerThread];
+    const uint16_t* coef_row = params.coef + static_cast<int64_t>(row) * params.coef_stride;
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      const uint32_t col = col0 + v * 256;
+      own[v] = params.partial[row * kRowVecs + col / 8];
+      res4[v] = *reinterpret_cast<const uint4*>(params.residual + static_cast<size_t>(row) * kHidden + col);
+      d0[v] = bf(coef_row[col / 16]);
+      d1[v] = bf(coef_row[kGroups + col / 16]);
+      clear_pos_zero(own[v]);
+    }
+    // partials of the vectors owned elsewhere, to their owners
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      const uint32_t owner = (v * 32 + lane) / kPer;
+      if (owner == params.rank) continue;
+      const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+      uint8_t* slot = params.ws.workspaces[owner] + (params.rank + phase * kWorld) * params.ws.slot_bytes;
+      device::ptx::st_relaxed_16B(own[v], slot, vid);
+    }
+    // owned vectors: every rank's partial, fp32 sum in rank order, one bf16 rounding (as the one-shot path)
+    float x[kVecsPerThread][8];
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      if ((v * 32 + lane) / kPer != params.rank) continue;
+      const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+      uint4 vec[kWorld];
+#pragma unroll
+      for (uint32_t i = 0; i < kWorld; ++i) {
+        if (i == params.rank) {
+          vec[i] = own[v];
+          continue;
+        }
+        uint8_t* slot = params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes;
+        uint32_t polls = 0;
+        do {
+          device::ptx::ld_relaxed_16B(vec[i], slot, vid);
+          if (!has_zero(vec[i])) break;
+          if (++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
+        } while (true);
+        device::ptx::st_global_16B(make_uint4(0u, 0u, 0u, 0u), slot, vid);
+      }
+#pragma unroll
+      for (uint32_t w = 0; w < 4; ++w) {
+        float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < kWorld; ++i) {
+          const uint32_t word = (&vec[i].x)[w];
+          const float a = bf(word & 0xffffu), b = bf(word >> 16);
+          lo = i == 0 ? a : __fadd_rn(lo, a);
+          hi = i == 0 ? b : __fadd_rn(hi, b);
+        }
+        const uint32_t lo16 = to_bf16_bits(lo), hi16 = to_bf16_bits(hi);
+        x[v][2 * w] = bf(lo16);
+        x[v][2 * w + 1] = bf(hi16);
+        *reinterpret_cast<uint32_t*>(&xs[t][lane * 8 + v * 256 + 2 * w]) = lo16 | (hi16 << 16);
+      }
+    }
+    __syncthreads();
+    // owned vectors: output-side convolution (as the one-shot path); the encoded y is kept and sent to every rank
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      if ((v * 32 + lane) / kPer != params.rank) continue;
+      uint4 prev4 = make_uint4(0u, 0u, 0u, 0u);
+      if (t >= 1) prev4 = *reinterpret_cast<const uint4*>(&xs[t - 1][lane * 8 + v * 256]);
+      uint32_t yw[4];
+#pragma unroll
+      for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t w = e / 2;
+        const uint32_t sh = (e % 2) * 16;
+        const float c0 = __fadd_rn(bf(((&b0[v].x)[w] >> sh) & 0xffffu), d0[v]);
+        const float c1 = __fadd_rn(bf(((&b1[v].x)[w] >> sh) & 0xffffu), d1[v]);
+        const float prev = t >= 1 ? bf(((&prev4.x)[w] >> sh) & 0xffffu) : 0.0f;
+        const uint32_t y16 = to_bf16_bits(__fmaf_rn(c0, x[v][e], __fmul_rn(c1, prev)));
+        if (e % 2 == 0)
+          yw[w] = y16;
+        else
+          yw[w] |= y16 << 16;
+      }
+      y4[v] = make_uint4(yw[0], yw[1], yw[2], yw[3]);
+      clear_pos_zero(y4[v]);
+      const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+#pragma unroll
+      for (uint32_t dst = 0; dst < kWorld; ++dst) {
+        if (dst == params.rank) continue;
+        uint8_t* slot = params.ws.workspaces[dst] + (params.rank + phase * kWorld) * params.ws.slot_bytes;
+        device::ptx::st_relaxed_16B(y4[v], slot, vid);
+      }
+    }
+    // vectors owned elsewhere: y from their owners
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      const uint32_t owner = (v * 32 + lane) / kPer;
+      if (owner == params.rank) continue;
+      const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+      uint8_t* slot = params.ws.workspaces[params.rank] + (owner + phase * kWorld) * params.ws.slot_bytes;
+      uint32_t polls = 0;
+      do {
+        device::ptx::ld_relaxed_16B(y4[v], slot, vid);
+        if (!has_zero(y4[v])) break;
+        if (++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
+      } while (true);
+      device::ptx::st_global_16B(make_uint4(0u, 0u, 0u, 0u), slot, vid);
+    }
+    // residual add and sum of squares from y (as the one-shot path)
+#pragma unroll
+    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+      const uint32_t col = col0 + v * 256;
+      uint32_t res_out[4];
+#pragma unroll
+      for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t w = e / 2;
+        const uint32_t sh = (e % 2) * 16;
+        const float yv = bf(((&y4[v].x)[w] >> sh) & 0xffffu);
+        const float hv = __fadd_rn(yv, bf(((&res4[v].x)[w] >> sh) & 0xffffu));
+        h[v][e] = hv;
+        ss = __fmaf_rn(hv, hv, ss);
+        const uint32_t r16 = to_bf16_bits(hv);
+        if (e % 2 == 0)
+          res_out[w] = r16;
+        else
+          res_out[w] |= r16 << 16;
+      }
+      *reinterpret_cast<uint4*>(params.residual + static_cast<size_t>(row) * kHidden + col) =
+          make_uint4(res_out[0], res_out[1], res_out[2], res_out[3]);
+    }
+  } else {
   // this rank's partial (and, in the test path, every rank's), residual and coefficients, issued together
   uint4 vec[kVecsPerThread][kWorld];  // peers' vectors (every rank's in the test path)
   uint4 own[kVecsPerThread];
@@ -365,8 +522,6 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   __syncthreads();
 
   // output-side convolution, residual add, sum of squares
-  float h[kVecsPerThread][8];
-  float ss = 0.0f;
 #pragma unroll
   for (uint32_t v = 0; v < kVecsPerThread; ++v) {
     const uint32_t col = col0 + v * 256;
@@ -393,6 +548,7 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
     *reinterpret_cast<uint4*>(params.residual + static_cast<size_t>(row) * kHidden + col) =
         make_uint4(res_out[0], res_out[1], res_out[2], res_out[3]);
   }
+  }  // one-shot path
 #pragma unroll
   for (uint32_t m = 16; m >= 1; m /= 2) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, m));
 
@@ -638,7 +794,8 @@ __global__ __launch_bounds__((kBlock / kSplit + 1) * 32) void draft_ar_norm_spli
 using host::distributed::CommunicatorRef;
 
 template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL, bool kPollAll = false,
-          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false>
+          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false,
+          bool kTwoShot = false>
 struct MuseVrDraftArNorm {
   using TensorView = tvm::ffi::TensorView;
   using P = muse_vr_draft_arn::Params<kWorld>;
@@ -705,7 +862,7 @@ struct MuseVrDraftArNorm {
     p.partial_all = nullptr;
     constexpr auto kernel =
         muse_vr_draft_arn::draft_ar_norm_kernel<kHidden, kWorld, kCluster, kUsePDL, false, kPollAll, kEarlyTrigger,
-                                                kConsumerOnly, kMcPush, kMbarX>;
+                                                kConsumerOnly, kMcPush, kMbarX, kTwoShot>;
     allow_cluster(kernel);
     LaunchKernel(grid, muse_vr_draft_arn::kThreads, device.unwrap())
         .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kCluster, 1, 1)})(kernel, p);
