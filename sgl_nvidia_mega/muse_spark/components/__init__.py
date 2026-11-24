@@ -67,6 +67,7 @@ COMPONENTS = (
     "final_norm",
     "draft_kv_append",
     "input_norm",
+    "aux_side",  # after final_norm / input_norm: wraps their model-forward hooks; stock when the last layer is captured
     "verify_mk",  # own hook target (install_megakernel); wraps layer instances, outside every class-level hook
     "verify_attn",
     "qkv_qk_fold",  # no hook: ar_attn_boundary / verify_attn call it (reads verify_attn's decisions per call)
