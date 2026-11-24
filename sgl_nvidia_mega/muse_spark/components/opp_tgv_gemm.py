@@ -21,6 +21,15 @@
 # eight vectors in flight per thread).
 # Modified by NVIDIA: mode 7 (publish) stores each 16-byte vector once through the multicast address of a gather slot
 # instead (multimem.st), with the all-gather's per-half empty-marker remap, and no plain output.
+# Modified by NVIDIA: optional split-K (constructor argument ``split_k``, default 1 = unchanged): K is divided into
+# split_k equal chunks over grid z; every CTA stores its fp32 accumulator fragment to a workspace and counts itself in;
+# the last CTA of each output tile sums the fragments in split order (z = 0, 1, ...) in fp32 and is the only one that
+# stores the tile. With ``sk_cluster`` (1-CTA tiles) the split CTAs of a tile form one cluster instead: each copies its
+# fragment to the workspace, the cluster meets once, and each sums a share of the tile's rows in the same order and
+# stores it.
+# Modified by NVIDIA: the cluster split-K push exchange also runs on 2-CTA tile pairs: cluster (2, 1, split_k), the pair of
+# split z is cluster ranks (2 z, 2 z + 1), its even CTA issues the pair's MMAs and the pair's commits / peer arrives target
+# that pair; each CTA exchanges its own 64 output features with the CTAs of the same pair position in the other splits.
 """CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
@@ -65,6 +74,9 @@ SGLANG_READS = {
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
 # Tactic 1 (1-CTA 64×8 stages=8) is the default.
 _TGV_CUTE_EXT_CTA_K: int = 128
+_TGV_TMEM_COLS: int = (
+    256  # TMEM columns each CTA allocates (alloc and every dealloc use this one value)
+)
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
 _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     # 1-CTA configs
@@ -98,6 +110,21 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 32, 6, True),  # 26
     (128, 64, 5, True),  # 27
     (128, 128, 4, True),  # 28
+    # 2-CTA wide-row configs (split-K use)
+    (64, 160, 5, True),  # 29
+    (64, 192, 4, True),  # 30
+    (64, 256, 4, True),  # 31
+    # 1-CTA wide-row configs (cluster split-K use)
+    (64, 160, 3, False),  # 32
+    (64, 192, 3, False),  # 33
+    (64, 256, 2, False),  # 34
+    # 1-CTA config with room for the cluster split-K receive buffer
+    (64, 64, 5, False),  # 35
+    # 2-CTA configs with room for the cluster split-K receive buffer (cluster split-K push exchange on tile pairs)
+    (64, 64, 8, True),  # 36
+    (64, 128, 5, True),  # 37
+    (64, 192, 4, True),  # 38
+    (64, 256, 3, True),  # 39
 ]
 
 
@@ -141,6 +168,184 @@ def _publish_vector(s_addr, mc_addr):
         [cutlass.Int32(s_addr).ir_value(), cutlass.Int64(mc_addr).ir_value()],
         publish_vector_ptx("$0", "$1"),
         "r,l",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def l2_reduce_ptx(split_k: int, publish: bool) -> str:
+    """PTX of one output vector of the cluster split-K exchange through the workspace ($0 = workspace address of split 0's 8
+    fp32 values of the vector, $3 = byte stride between splits, $1 = global / multicast destination, $2 = nonzero when the
+    vector is in range): all split_k x 2 ld.relaxed.gpu.global.v4.f32 issued first, then the fp32 adds in z order, bf16
+    rounding (cvt.rn.bf16x2.f32) and the publish store (empty-marker remap + multimem.st) or a plain st.global.v4."""
+    lines = [
+        "{",
+        f".reg .f32 c<8>, t<{8 * split_k}>;",
+        ".reg .b32 w<4>, b<4>, h;",
+        f".reg .b64 ga<{split_k}>;",
+        ".reg .pred p, q;",
+        "setp.ne.u32 p, $2, 0;",
+        "mov.b64 ga0, $0;",
+    ]
+    for z in range(1, split_k):
+        lines.append(f"add.s64 ga{z}, ga{z - 1}, $3;")
+    for z in range(split_k):
+        b = 8 * z
+        lines.append(
+            f"@p ld.relaxed.gpu.global.v4.f32 {{t{b}, t{b + 1}, t{b + 2}, t{b + 3}}}, [ga{z}];"
+        )
+        lines.append(
+            f"@p ld.relaxed.gpu.global.v4.f32 {{t{b + 4}, t{b + 5}, t{b + 6}, t{b + 7}}}, [ga{z}+16];"
+        )
+    for k in range(8):
+        lines.append(f"mov.f32 c{k}, t{k};")
+    for z in range(1, split_k):
+        for k in range(8):
+            lines.append(f"add.rn.f32 c{k}, c{k}, t{8 * z + k};")
+    for k in range(4):
+        lines.append(f"cvt.rn.bf16x2.f32 w{k}, c{2 * k + 1}, c{2 * k};")
+    if publish:
+        for k in range(4):
+            lines.append(f"and.b32 h, w{k}, 0x0000FFFF;")
+            lines.append("setp.eq.b32 q, h, 0;")
+            lines.append(f"selp.b32 b{k}, 0x00008000, 0, q;")
+            lines.append(f"and.b32 h, w{k}, 0xFFFF0000;")
+            lines.append("setp.eq.b32 q, h, 0;")
+            lines.append(f"@q or.b32 b{k}, b{k}, 0x80000000;")
+            lines.append(f"or.b32 b{k}, w{k}, b{k};")
+        lines.append("@p multimem.st.relaxed.sys.global.v4.f32 [$1], {b0, b1, b2, b3};")
+    else:
+        lines.append("@p st.global.v4.b32 [$1], {w0, w1, w2, w3};")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _l2_reduce_vector(split_k, publish, g_src, g_dst, ok, stride):
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(g_src).ir_value(),
+            cutlass.Int64(g_dst).ir_value(),
+            cutlass.Int32(ok).ir_value(),
+            cutlass.Int64(stride).ir_value(),
+        ],
+        l2_reduce_ptx(split_k, publish),
+        "l,l,r,l,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def push_reduce_ptx(split_k: int, publish: bool) -> str:
+    """PTX of one output vector of the cluster split-K push exchange ($0 .. $(split_k - 1) = shared addresses of split z's 8
+    fp32 values of the vector, all in this CTA's shared memory (its own staged copy or a peer's pushed copy); $split_k =
+    global / multicast destination; $(split_k + 1) = nonzero when the vector is in range): all loads first, then the fp32
+    adds in z order, bf16 rounding (cvt.rn.bf16x2.f32) and the publish store (empty-marker remap + multimem.st) or a plain
+    st.global.v4."""
+    lines = [
+        "{",
+        f".reg .f32 c<8>, t<{8 * split_k}>;",
+        ".reg .b32 w<4>, b<4>, h;",
+        ".reg .pred p, q;",
+        f"setp.ne.u32 p, ${split_k + 1}, 0;",
+    ]
+    for z in range(split_k):
+        b = 8 * z
+        lines.append(
+            f"@p ld.shared.v4.f32 {{t{b}, t{b + 1}, t{b + 2}, t{b + 3}}}, [${z}];"
+        )
+        lines.append(
+            f"@p ld.shared.v4.f32 {{t{b + 4}, t{b + 5}, t{b + 6}, t{b + 7}}}, [${z}+16];"
+        )
+    for k in range(8):
+        lines.append(f"mov.f32 c{k}, t{k};")
+    for z in range(1, split_k):
+        for k in range(8):
+            lines.append(f"add.rn.f32 c{k}, c{k}, t{8 * z + k};")
+    for k in range(4):
+        lines.append(f"cvt.rn.bf16x2.f32 w{k}, c{2 * k + 1}, c{2 * k};")
+    if publish:
+        for k in range(4):
+            lines.append(f"and.b32 h, w{k}, 0x0000FFFF;")
+            lines.append("setp.eq.b32 q, h, 0;")
+            lines.append(f"selp.b32 b{k}, 0x00008000, 0, q;")
+            lines.append(f"and.b32 h, w{k}, 0xFFFF0000;")
+            lines.append("setp.eq.b32 q, h, 0;")
+            lines.append(f"@q or.b32 b{k}, b{k}, 0x80000000;")
+            lines.append(f"or.b32 b{k}, w{k}, b{k};")
+        lines.append(
+            f"@p multimem.st.relaxed.sys.global.v4.f32 [${split_k}], {{b0, b1, b2, b3}};"
+        )
+    else:
+        lines.append(f"@p st.global.v4.b32 [${split_k}], {{w0, w1, w2, w3}};")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _push_reduce_vector(split_k, publish, s_addrs, g_addr, ok):
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(a).ir_value() for a in s_addrs]
+        + [cutlass.Int64(g_addr).ir_value(), cutlass.Int32(ok).ir_value()],
+        push_reduce_ptx(split_k, publish),
+        ",".join(["r"] * split_k + ["l", "r", "~{memory}"]),
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _push_block(slot_addr, src_addr, mbar_addr, peer, ok, nbytes):
+    """Cluster split-K push exchange: one bulk copy of this CTA's staged rows owned by cluster CTA ``peer`` into that CTA's
+    receive slot (same shared offset there), completing on that CTA's exchange mbarrier (complete_tx::bytes)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(slot_addr).ir_value(),
+            cutlass.Int32(src_addr).ir_value(),
+            cutlass.Int32(mbar_addr).ir_value(),
+            cutlass.Int32(peer).ir_value(),
+            cutlass.Int32(ok).ir_value(),
+            cutlass.Int32(nbytes).ir_value(),
+        ],
+        "{\n.reg .b32 d, m;\n.reg .pred p;\nsetp.ne.u32 p, $4, 0;\nmapa.shared::cluster.u32 d, $0, $3;\n"
+        "mapa.shared::cluster.u32 m, $2, $3;\n"
+        "@p cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [d], [$1], $5, [m];\n}",
+        "r,r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _asm0(text):
+    llvm.inline_asm(
+        None,
+        [],
+        text,
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _stage_out_vector(s_addr, g_addr):
+    """Cluster split-K through the workspace: one staged 16-byte fp32 vector from shared to global memory."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(s_addr).ir_value(), cutlass.Int64(g_addr).ir_value()],
+        "{\n.reg .b32 a<4>;\nld.shared.v4.b32 {a0, a1, a2, a3}, [$0];\nst.global.v4.b32 [$1], {a0, a1, a2, a3};\n}",
+        "r,l,~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _copy_vector(s_addr, g_addr):
+    """Split-K plain output: one restaged 16-byte vector to global memory (ld.shared.v4, st.global.v4)."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(s_addr).ir_value(), cutlass.Int64(g_addr).ir_value()],
+        "{\n.reg .b32 a<4>;\nld.shared.v4.b32 {a0, a1, a2, a3}, [$0];\nst.global.v4.b32 [$1], {a0, a1, a2, a3};\n}",
+        "r,l,~{memory}",
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
@@ -216,6 +421,11 @@ class TgvGemmCuteExtKernel:
         push_world: int = 1,
         test_drop_restage_barrier: bool = False,
         test_trigger_before_copy: bool = False,
+        split_k: int = 1,
+        test_sk_delay: bool = False,
+        sk_cluster: bool = False,
+        sk_push: bool = False,
+        test_push_delay: int = 0,
     ):
         # push_mode: 0 = plain epilogue (as SGLang); 1 = one-shot push (every peer slot); 2 = reduce-scatter push (the row
         # owner's slot, owner chunk = rows / push_world). Push modes need bf16 output, no bias and one batch.
@@ -258,6 +468,82 @@ class TgvGemmCuteExtKernel:
             )
         self.push_mode = push_mode
         self.push_world = push_world
+        # split_k > 1: grid z = split_k (one batch only); CTA z multiplies the z-th K chunk (the host passes A and B as
+        # [split_k, rows, K / split_k] views, K / split_k a multiple of cta_k). Each CTA stores its fp32 fragment to the
+        # workspace meta[21] (layout [tile][z][fragment / 4][128 threads] of 16-byte vectors, tile = N_idx * grid_x +
+        # M_idx) and counts itself in on the int32 tile counter meta[22] + 4 * tile (fence, then one acq_rel atomic). The
+        # CTA that counts last sums the S fragments in z order in fp32, resets the counter to 0 and runs the epilogue
+        # stores (bf16 output or publish); the others run the epilogue with its stores disabled. Needs bf16 output, no
+        # bias and the meta block (push_mode 0 included).
+        if split_k < 1 or (
+            split_k > 1 and (has_bias or out_dtype is not cutlass.BFloat16)
+        ):
+            raise ValueError("split_k needs split_k >= 1, bf16 output and no bias")
+        if split_k > 1 and push_mode not in (0, 7):
+            raise ValueError("split_k > 1 supports push_mode 0 and 7 only")
+        self.split_k = split_k
+        # sk_cluster (1-CTA tile configs, split_k in 2 / 4 / 8): the split_k CTAs of an output tile form one cluster
+        # (1, 1, split_k). Each stages its fp32 fragment in its own shared memory (padded row pitch) and copies it, row
+        # major, to the workspace meta[21] (layout [tile][z][row][cta_m] fp32); all threads of the cluster meet once
+        # (barrier.cluster arrive = release, wait = acquire); then CTA z reads the rows [z * cta_n / split_k,
+        # (z + 1) * cta_n / split_k) of all split_k copies (ld.relaxed.gpu, every read issued before the first add), sums
+        # them in z order in fp32 (the order of the counter form), rounds to bf16 and stores (plain or publish). No
+        # counter; no CTA waits on another outside the cluster barrier; every CTA stores a share of the tile.
+        # With a 2-CTA config (push exchange only, split_k in 2 / 4 so the cluster stays within 8 CTAs) the cluster is
+        # (2, 1, split_k): ranks 2 z and 2 z + 1 are the tile pair of split z (a CTA pair is two ranks that differ in the
+        # last bit only), each CTA holds its own cta_m output features of the pair's tile over all cta_n rows, and the
+        # exchange runs between the CTAs of the same pair position.
+        if sk_cluster and (
+            split_k not in ((2, 4) if use_2cta else (2, 4, 8))
+            or (use_2cta and not sk_push)
+            or cta_n % split_k
+            or (cta_n // split_k) * (cta_m // 8) > 1024
+        ):
+            raise ValueError(
+                "sk_cluster needs split_k in (2, 4, 8) (2-CTA: (2, 4) with sk_push) and cta_n divisible "
+                "by split_k"
+            )
+        if sk_cluster and not use_2cta and (cta_m + 4) * 4 > num_ab_stage * cta_k * 2:
+            # the staged fp32 fragment (cta_n rows of cta_m + 4 values) must fit in the B stage buffers
+            raise ValueError(
+                "sk_cluster: the staged fragment does not fit in the B stage buffers of this config"
+            )
+        self.sk_cluster = sk_cluster
+        # sk_push (cluster form only): instead of the workspace, each CTA bulk-copies (cp.async.bulk shared::cta ->
+        # shared::cluster) the staged rows owned by every other cluster CTA into that CTA's receive buffer [z][rows][cta_m]
+        # (its own shared memory region, never used by the main loop, so a push may land while the receiver is still in
+        # its main loop), completing on the receiver's exchange mbarrier (complete_tx::bytes); the receiver waits on its
+        # own mbarrier and sums its rows from shared memory in z order. The only cluster barrier is the one that publishes
+        # the mbarrier initialisation (relaxed arrive after init, wait before the first push).
+        if sk_push:
+            # stage buffers + receive buffer + 4 KiB for the barriers and words must fit the device's opt-in maximum
+            smem_max = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).shared_memory_per_block_optin
+            b_rows = (
+                cta_n // 2 if use_2cta else cta_n
+            )  # 2-CTA: each CTA's B stage holds half of the pair's rows
+            if (
+                not sk_cluster
+                or cta_m * 4 * cta_n > num_ab_stage * cta_k * 2 * b_rows
+                or num_ab_stage * (cta_m + b_rows) * cta_k * 2
+                + cta_n * cta_m * 4
+                + 4096
+                > smem_max
+            ):
+                raise ValueError(
+                    "sk_push needs sk_cluster, B stage buffers that hold the fp32 tile and room for the "
+                    "receive buffer within the device's shared memory per block"
+                )
+        self.sk_push = sk_push
+        # Test builds only (adversarial timing of the push exchange): 1 = the issuing thread pushes first and arms its own
+        # mbarrier (expect_tx) only after a sleep loop, so peers' complete_tx land before the arm; 2 = cluster CTA 0 sleeps
+        # before its pushes, so every receiver waits for it. Never set by any served path.
+        self.test_push_delay = test_push_delay
+        # Test builds only (order independence of the split-K sum): each CTA sleeps a pseudo-random time drawn from
+        # meta[23] and its block index before storing its fragment, so the CTA that counts last varies from call to call.
+        # Never set by any served path.
+        self.test_sk_delay = test_sk_delay
         # Test builds only (sanitizer non-vacuity): drop the named barrier between the restage writes and the vector
         # reads, which racecheck must report. Never set by any served path.
         self.test_drop_restage_barrier = test_drop_restage_barrier
@@ -292,14 +578,14 @@ class TgvGemmCuteExtKernel:
         # Fixed configuration matching the C++ / DSL kernels.
         self.threads_per_cta = 256  # 8 warps (warp 3 unused)
         if use_2cta:
-            # 2-CTA cluster along M; joint MMA tile = (cta_m*2, cta_n).
-            self.cluster_shape = (2, 1, 1)
+            # 2-CTA cluster along M; joint MMA tile = (cta_m*2, cta_n). Cluster split-K: (2, 1, split_k).
+            self.cluster_shape = (2, 1, split_k) if sk_cluster else (2, 1, 1)
             self.mma_tiler_mn = (cta_m * 2, cta_n)
             self.cta_group = tcgen05.CtaGroup.TWO
             self.tma_op = cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
         else:
-            # 1 SM mode, 1x1 cluster, no multicast.
-            self.cluster_shape = (1, 1, 1)
+            # 1 SM mode, no multicast; cluster (1, 1, split_k) for the cluster split-K exchange, else 1x1.
+            self.cluster_shape = (1, 1, split_k) if sk_cluster else (1, 1, 1)
             self.mma_tiler_mn = (cta_m, cta_n)
             self.cta_group = tcgen05.CtaGroup.ONE
             self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
@@ -311,6 +597,10 @@ class TgvGemmCuteExtKernel:
             f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
             f"_push{self.push_mode}w{self.push_world}"
+            + (f"_sk{self.split_k}" if self.split_k > 1 else "")
+            + ("_skc" if self.sk_cluster else "")
+            + ("p" if self.sk_push else "")
+            + (f"_pd{self.test_push_delay}" if self.test_push_delay else "")
         )
 
     @cute.experimental.jit
@@ -332,7 +622,9 @@ class TgvGemmCuteExtKernel:
             (
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n),
-                c.layout.shape[2],
+                c.layout.shape[2]
+                if cutlass.const_expr(self.split_k == 1)
+                else self.split_k,
             ),
             self.cluster_shape,
         )
@@ -404,7 +696,31 @@ class TgvGemmCuteExtKernel:
         # the leader role (issues MMAs / multicasts commits). In 1-CTA mode
         # every CTA is its own leader.
         leader_rank = cutlass.Int32(0)
-        if cutlass.const_expr(self.use_2cta):
+        pair_bit = cutlass.Int32(
+            0
+        )  # this CTA's position in its tile pair (2-CTA cluster split-K; 0 otherwise)
+        if cutlass.const_expr(self.use_2cta and self.sk_cluster):
+            # Cluster (2, 1, split_k): the pair of split z is ranks (2 z, 2 z + 1); its even CTA leads.
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+            # The mapping is checked at run time from the launch's own cluster registers: rank == x + 2 z, cluster
+            # (2, 1, split_k); the pair partner is rank ^ 1, so the leader is rank - (rank & 1). Any mismatch traps.
+            pc_x, pc_y, pc_z = cute.arch.block_in_cluster_idx()
+            pd_x, pd_y, pd_z = cute.arch.block_in_cluster_dim()
+            pair_bad = (
+                cutlass.Int32(cta_rank_in_cluster != pc_x + cutlass.Int32(2) * pc_z)
+                + cutlass.Int32(pc_y != 0)
+                + cutlass.Int32(pd_x != 2)
+                + cutlass.Int32(pd_y != 1)
+                + cutlass.Int32(pd_z != self.split_k)
+            )
+            if pair_bad != cutlass.Int32(0):
+                _asm0("trap;")
+            pair_bit = cta_rank_in_cluster & cutlass.Int32(1)
+            leader_rank = cta_rank_in_cluster - pair_bit
+            is_leader = pair_bit == cutlass.Int32(0)
+        elif cutlass.const_expr(self.use_2cta):
             cta_rank_in_cluster = cute.arch.make_warp_uniform(
                 cute.arch.block_idx_in_cluster()
             )
@@ -498,6 +814,25 @@ class TgvGemmCuteExtKernel:
         push_phase_arr = cute_ext.allocate(
             cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
         )
+        # Split-K: whether this CTA counted last on its tile counter (written by epilogue thread 0, read after a barrier).
+        sk_flag_arr = cute_ext.allocate(
+            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
+        )
+        if cutlass.const_expr(self.sk_push):
+            # Cluster split-K push exchange: an mbarrier that completes when every other cluster CTA's pushed rows have
+            # landed here, and the receive buffer [z][cta_n / split_k rows][cta_m] fp32.
+            skx_bar_arr = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            skx_recv_arr = cute_ext.allocate(
+                cutlass.Float32,
+                cute.AddressSpace.smem,
+                cute.make_layout(self.cta_n * self.cta_m),
+                alignment=128,
+            )
+        else:
+            skx_bar_arr = sk_flag_arr  # never read (no push exchange)
+            skx_recv_arr = sk_flag_arr
 
         bar_full = bar_full_arr.iterator  # Pointer[Int64], DMA_Stage
         bar_empty = bar_empty_arr.iterator  # Pointer[Int64], DMA_Stage
@@ -522,9 +857,17 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(
                     bar_tmem_alloc, 32 + 128
                 )  # MMA + 4 EPILOG warps
+                if cutlass.const_expr(self.sk_push):
+                    cute.arch.mbarrier_init(
+                        skx_bar_arr.iterator, 1
+                    )  # the receiver's own expect_tx arrival
 
         cute.arch.mbarrier_init_fence()
-        if cutlass.const_expr(self.use_2cta):
+        if cutlass.const_expr(self.use_2cta and self.sk_cluster):
+            # 2-CTA cluster split-K: the pair's and the exchange's mbarriers of every cluster CTA are initialised (and
+            # fenced) before any cross-CTA arrive or push: arrive (release) here, wait (acquire) before the dispatch.
+            cute.arch.cluster_arrive()
+        elif cutlass.const_expr(self.use_2cta):
             # Cluster-wide sync: ensure peer's barriers are visible before any
             # cross-CTA arrives. Splitting arrive/wait lets the per-CTA tile
             # setup below overlap with the cluster barrier. (Implicit
@@ -532,7 +875,13 @@ class TgvGemmCuteExtKernel:
             cute.arch.cluster_arrive_relaxed()
         else:
             cute.arch.barrier()
+            if cutlass.const_expr(self.sk_push):
+                # every CTA's exchange mbarrier is initialised (and fenced, release.cluster) before any peer pushes to it:
+                # relaxed arrive here, wait before the first push (epilogue) or after the role (other warps)
+                cute.arch.cluster_arrive_relaxed()
 
+        # Split-K: the host passes A and B as K-chunk views (Gemm_K = K / split_k, Gemm_L = split_k), so grid z (the
+        # split index) selects the chunk through the batch mode of A and B; C has one batch.
         work_tile_info = WorkTileInfo(
             M_idx=bidx,
             N_idx=bidy,
@@ -541,6 +890,8 @@ class TgvGemmCuteExtKernel:
             K_idx_end=cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k),
         )
         k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start
+        sk_idx = bidz
+        c_l_idx = bidz if cutlass.const_expr(self.split_k == 1) else cutlass.Int32(0)
 
         # ---- CTA-to-Value maps for TMA (constexpr) ----
         # Encodes "which cluster CTA is responsible for which slice", i.e.
@@ -563,7 +914,9 @@ class TgvGemmCuteExtKernel:
         )
         # gB n-index: 1-CTA just bidy; 2-CTA each cluster N_idx covers
         # num_mma_ctas tiles of b_tiler, each CTA loads one half.
-        if cutlass.const_expr(self.use_2cta):
+        if cutlass.const_expr(self.use_2cta and self.sk_cluster):
+            gB_n_idx = work_tile_info.N_idx * num_mma_ctas + pair_bit
+        elif cutlass.const_expr(self.use_2cta):
             gB_n_idx = work_tile_info.N_idx * num_mma_ctas + cta_rank_in_cluster
         else:
             gB_n_idx = work_tile_info.N_idx
@@ -575,7 +928,7 @@ class TgvGemmCuteExtKernel:
         gD_tile = cute.local_tile(  # (cta_m, cta_n)
             mC,
             c_tiler_mn,
-            (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
+            (work_tile_info.M_idx, work_tile_info.N_idx, c_l_idx),
         )
         # gBias_tile: same (cta_m, cta_n) shape as gD_tile but stride (1, 0)
         # — the same M element is repeated across N. local_tile preserves the
@@ -583,7 +936,7 @@ class TgvGemmCuteExtKernel:
         gBias_tile = cute.local_tile(  # (cta_m, cta_n) stride (1, 0)
             mBias,
             c_tiler_mn,
-            (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
+            (work_tile_info.M_idx, work_tile_info.N_idx, c_l_idx),
         )
 
         if cutlass.const_expr(self.use_2cta):
@@ -618,6 +971,7 @@ class TgvGemmCuteExtKernel:
         elif warp_idx == 2:
             self.mma_warp(
                 is_leader,
+                leader_rank,
                 bar_full,
                 bar_empty,
                 bar_mma_epilog,
@@ -654,11 +1008,28 @@ class TgvGemmCuteExtKernel:
                 c_dtype,
                 d_layout,
                 sA,
+                sB,
                 push_phase_arr,
                 mMeta,
                 work_tile_info.M_idx,
                 work_tile_info.N_idx,
+                sk_idx,
+                sk_flag_arr,
+                skx_bar_arr,
+                skx_recv_arr,
+                pair_bit,
             )
+
+        if cutlass.const_expr(self.sk_cluster):
+            # Cluster split-K exchange: every thread of the cluster meets the exchange barrier; the epilogue warps meet
+            # it inside the epilogue (after the workspace copy), the other warps here after their roles.
+            if warp_idx < 4:
+                # (2-CTA push exchange: nothing here; every thread already waited at the entry cluster barrier)
+                if cutlass.const_expr(self.sk_push and not self.use_2cta):
+                    cute.arch.cluster_wait()
+                elif cutlass.const_expr(not self.sk_push):
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
 
         if cutlass.const_expr(self.use_2cta):
             # Cluster-wide exit barrier (sgl-project/sglang#32907): cluster
@@ -672,8 +1043,21 @@ class TgvGemmCuteExtKernel:
             # relaxed arrive (matches the entry barrier at L378): this fence is
             # only about CTA lifetime, not inter-CTA smem visibility -- every
             # cross-CTA datum above already flows through mbarrier phases.
+            if cutlass.const_expr(self.sk_cluster):
+                # 2-CTA cluster split-K: order every thread's tcgen05 operations (MMA / commit / TMEM loads, the epilogue's
+                # after its wait::ld) before the barrier, for the joint dealloc below.
+                _asm0("tcgen05.fence::before_thread_sync;")
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
+            if cutlass.const_expr(self.sk_cluster):
+                # 2-CTA cluster split-K: the pair's joint TMEM dealloc after every CTA's epilogue loads have completed
+                # (each epilogue waits for its tcgen05.ld before it reaches the barrier above), ordered after the barrier.
+                if warp_idx == 2:
+                    _asm0("tcgen05.fence::after_thread_sync;")
+                    dealloc_ptr = cute.arch.retrieve_tmem_ptr(
+                        self.acc_dtype, 16, tmem_base_ptr
+                    )
+                    cute.arch.dealloc_tmem(dealloc_ptr, _TGV_TMEM_COLS, is_two_cta=True)
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
@@ -907,6 +1291,7 @@ class TgvGemmCuteExtKernel:
     def mma_warp(
         self,
         is_leader: cutlass.Boolean,
+        leader_rank: cutlass.Int32,  # 2-CTA cluster split-K: the pair's even rank (commit mask base)
         bar_full,  # Pointer[Int64], DMA_Stage entries
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
@@ -939,7 +1324,7 @@ class TgvGemmCuteExtKernel:
         # alloc on the other half. For CTA_M=64 the accumulator only uses
         # 64 lanes (16 lanes × 4 subpartitions), well within half-of-TMEM.
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
-        num_tmem_cols = 256
+        num_tmem_cols = _TGV_TMEM_COLS
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
@@ -961,6 +1346,9 @@ class TgvGemmCuteExtKernel:
             mma_atom = cute.make_mma_atom(tiled_mma.op)
             # 2-CTA: mask=0b11 multicasts the commit to both CTAs' bar_empty.
             commit_mask = 0b11 if self.use_2cta else None
+            if cutlass.const_expr(self.use_2cta and self.sk_cluster):
+                # Cluster (2, 1, split_k): the pair's two ranks only.
+                commit_mask = cutlass.Int32(3) << leader_rank
 
             full_phase = cutlass.Int32(0)
             for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -1012,7 +1400,9 @@ class TgvGemmCuteExtKernel:
         # half; the cluster-shared accumulator is just a logical view.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
+        if cutlass.const_expr(not (self.use_2cta and self.sk_cluster)):
+            cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
+        # (2-CTA cluster split-K: both CTAs dealloc after the exit cluster barrier, when neither has a TMEM access left)
 
     @cute.experimental.jit
     def copy_warp(self, mMeta: cute.Tensor, bidx: cutlass.Int32, bidy: cutlass.Int32):
@@ -1206,10 +1596,16 @@ class TgvGemmCuteExtKernel:
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
         sA: cute.Tensor,  # A stage buffers: reused as the restage tile by the push epilogue (after the last MMA)
+        sB: cute.Tensor,  # B stage buffers: reused as the staged fp32 fragment by the cluster split-K exchange
         push_phase: cute.Tensor,  # (1,) Int32 in shared memory (push epilogue only)
         mMeta: cute.Tensor,  # (PUSH_META_LEN,) int64 push arguments (push epilogue only)
         m_idx: cutlass.Int32,  # this CTA's tile index along kernel M (output features)
         n_idx: cutlass.Int32,  # this CTA's tile index along kernel N (rows)
+        sk_idx: cutlass.Int32,  # split index (split-K; 0 otherwise)
+        sk_flag: cute.Tensor,  # (1,) Int32 in shared memory (split-K only)
+        skx_bar: cute.Tensor,  # (1,) Int64 mbarrier in shared memory (cluster split-K push exchange only)
+        skx_recv: cute.Tensor,  # receive buffer in shared memory (cluster split-K push exchange only)
+        pair_bit: cutlass.Int32,  # 2-CTA cluster split-K: this CTA's position in its tile pair (0 otherwise)
     ):
         # Sync with MMA's alloc_tmem (phase 0 of bar_tmem_alloc): 128 arrivals
         # from this warp + 32 from MMA = 160. tmem_base_ptr is uninitialized
@@ -1219,6 +1615,11 @@ class TgvGemmCuteExtKernel:
 
         # Push epilogue: everything the push needs except the tile itself is loaded here, while the main loop runs.
         # The phase word is published by DMA_B after its dependency wait (bar_tma_epilog, 32 arrivals).
+        if cutlass.const_expr(self.push_mode == 0 and self.split_k > 1):
+            # Split-K plain output: restaged 16-byte vectors to meta[5] (row pitch meta[6]), rows < meta[3].
+            push_rows = cutlass.Int64(mMeta[3])
+            push_out = cutlass.Int64(mMeta[5])
+            push_ldc = cutlass.Int64(mMeta[6])
         if cutlass.const_expr(self.push_mode != 0):
             cute.arch.mbarrier_wait(bar_tma_epilog, 0)
             if cutlass.const_expr(self.push_mode == 6):
@@ -1367,6 +1768,300 @@ class TgvGemmCuteExtKernel:
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
+        # Split-K: store this CTA's fragment and count in; the CTA that counts last sums the fragments in split order and
+        # is the only one whose output stores are enabled (the others run the epilogue with zero rows).
+        if cutlass.const_expr(self.split_k > 1 and not self.sk_cluster):
+            # Fragment store: thread t's fp32 fragment (cta_m * cta_n / 128 values, register order) as 16-byte vectors at
+            # ws + ((tile * S + z) * (frag / 4) + i) * 2048 + t * 16, so a warp's i-th vectors are contiguous.
+            sk_nv4 = self.cta_m * self.cta_n // 512
+            sk_gx, _, _ = cute.arch.grid_dim()
+            sk_tile = cutlass.Int64(n_idx) * cutlass.Int64(sk_gx) + cutlass.Int64(m_idx)
+            sk_ws = cutlass.Int64(mMeta[21])
+            sk_cnt = cutlass.Int64(mMeta[22]) + sk_tile * cutlass.Int64(4)
+            sk_r4 = cute.make_tensor(
+                rAcc.iterator, cute.make_layout((4, sk_nv4), stride=(1, 4))
+            )
+            sk_off = (
+                sk_tile * cutlass.Int64(self.split_k) + cutlass.Int64(sk_idx)
+            ) * cutlass.Int64(sk_nv4 * 2048)
+            sk_own = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Float32,
+                    sk_ws + sk_off + cutlass.Int64(epi_tid) * cutlass.Int64(16),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((4, sk_nv4), stride=(1, 512)),
+            )
+            if cutlass.const_expr(self.test_sk_delay):
+                sk_bx, sk_by, sk_bz = cute.arch.block_idx()
+                sk_h = (
+                    cutlass.Int32(mMeta[23]) * cutlass.Int32(1103515245)
+                    + sk_bx * cutlass.Int32(97)
+                    + sk_by * cutlass.Int32(1031)
+                    + sk_bz * cutlass.Int32(7919)
+                )
+                sk_h = sk_h ^ (sk_h >> cutlass.Int32(13))
+                for _ in cutlass.range(sk_h & cutlass.Int32(15), unroll=1):
+                    llvm.inline_asm(
+                        None,
+                        [],
+                        "nanosleep.u32 400;",
+                        "~{memory}",
+                        has_side_effects=True,
+                        asm_dialect=llvm.AsmDialect.AD_ATT,
+                    )
+            sk_own.store(sk_r4.load())
+            # Release: every thread fences its own stores, the epilogue threads meet, one thread counts in (acq_rel).
+            llvm.inline_asm(
+                None,
+                [],
+                "fence.acq_rel.gpu;",
+                "~{memory}",
+                has_side_effects=True,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            if epi_tid == cutlass.Int32(0):
+                sk_old = cutlass.Int32(
+                    llvm.inline_asm(
+                        T.i32(),
+                        [sk_cnt.ir_value()],
+                        "atom.acq_rel.gpu.global.add.u32 $0, [$1], 1;",
+                        "=r,l,~{memory}",
+                        has_side_effects=True,
+                        asm_dialect=llvm.AsmDialect.AD_ATT,
+                    )
+                )
+                sk_flag[0] = cutlass.Int32(sk_old == cutlass.Int32(self.split_k - 1))
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            if sk_flag[0] != cutlass.Int32(0):
+                # Acquire (after thread 0's atomic observed every other count): fence, then sum the fragments in
+                # z order, fp32 adds left to right; this CTA's own fragment is read back like the others.
+                llvm.inline_asm(
+                    None,
+                    [],
+                    "fence.acq_rel.gpu;",
+                    "~{memory}",
+                    has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT,
+                )
+                sk_base = sk_tile * cutlass.Int64(self.split_k) * cutlass.Int64(
+                    sk_nv4 * 2048
+                ) + cutlass.Int64(epi_tid) * cutlass.Int64(16)
+                for i in cutlass.range_constexpr(sk_nv4):
+                    sk_acc = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Float32,
+                            sk_ws + sk_base + cutlass.Int64(i * 2048),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout(4),
+                    ).load()
+                    for z in cutlass.range_constexpr(1, self.split_k):
+                        sk_acc = (
+                            sk_acc
+                            + cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.Float32,
+                                    sk_ws
+                                    + sk_base
+                                    + cutlass.Int64(z * sk_nv4 * 2048 + i * 2048),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout(4),
+                            ).load()
+                        )
+                    sk_r4[None, i].store(sk_acc)
+                if epi_tid == cutlass.Int32(0):
+                    llvm.inline_asm(
+                        None,
+                        [sk_cnt.ir_value(), cutlass.Int32(0).ir_value()],
+                        "st.relaxed.gpu.global.u32 [$0], $1;",
+                        "l,r,~{memory}",
+                        has_side_effects=True,
+                        asm_dialect=llvm.AsmDialect.AD_ATT,
+                    )
+        if cutlass.const_expr(self.sk_push):
+            # Cluster split-K, push exchange: stage this CTA's fp32 fragment in its B stage buffers (row-major, pitch cta_m,
+            # last accessed by the async proxy), make the writes visible to the async proxy, meet the cluster once (every
+            # peer's exchange mbarrier is initialised), push the rows each peer owns into its receive slot, wait for the
+            # peers' pushes on this CTA's own mbarrier, then reduce this CTA's rows from shared memory in z order.
+            skp_base = cutlass.Int32(sB.iterator.toint())
+            skp_rows = self.cta_n // self.split_k
+            skp_blk = skp_rows * self.cta_m * 4
+            skp_recv = cutlass.Int32(skx_recv.iterator.toint())
+            sPp = cute.make_tensor(
+                cute.make_ptr(
+                    self.acc_dtype, skp_base, cute.AddressSpace.smem, assumed_align=128
+                ),
+                cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
+            )
+            sPp_epi = cute.flat_divide(sPp, epi_tile)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute_ext.partition_and_copy(thr_t2r, rAcc, sPp_epi[None, None, 0, 0])
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            if cutlass.const_expr(not self.use_2cta):
+                cute.arch.cluster_wait()  # 2-CTA: the entry cluster barrier (wait before the warp dispatch) did this
+            skp_bar = cutlass.Int32(skx_bar.iterator.toint())
+            if epi_tid == cutlass.Int32(0):
+                if cutlass.const_expr(self.test_push_delay != 1):
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        skx_bar.iterator, (self.split_k - 1) * skp_blk
+                    )
+                if cutlass.const_expr(self.test_push_delay == 2):
+                    if sk_idx == cutlass.Int32(0):
+                        for _ in cutlass.range(20, unroll=1):
+                            _asm0("nanosleep.u32 1000;")
+                for skp_z in cutlass.range_constexpr(self.split_k):
+                    # cluster rank of split skp_z's CTA at this CTA's pair position (1-CTA: skp_z)
+                    skp_peer = (
+                        cutlass.Int32(skp_z * (2 if self.use_2cta else 1)) + pair_bit
+                    )
+                    _push_block(
+                        skp_recv + sk_idx * cutlass.Int32(skp_blk),
+                        skp_base + cutlass.Int32(skp_z * skp_blk),
+                        skp_bar,
+                        skp_peer,
+                        cutlass.Int32(sk_idx != cutlass.Int32(skp_z)),
+                        cutlass.Int32(skp_blk),
+                    )
+                _asm0("cp.async.bulk.commit_group;")
+                if cutlass.const_expr(self.test_push_delay == 1):
+                    for _ in cutlass.range(20, unroll=1):
+                        _asm0("nanosleep.u32 1000;")
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        skx_bar.iterator, (self.split_k - 1) * skp_blk
+                    )
+            cute.arch.mbarrier_wait(skx_bar.iterator, 0)
+            skp_vpr = self.cta_m // 8
+            skp_nvec = skp_rows * skp_vpr
+            if cutlass.const_expr(self.push_mode == 7):
+                skp_dst = push_peers[0]
+            else:
+                skp_dst = push_out
+            for skp_i in cutlass.range_constexpr((skp_nvec + 127) // 128):
+                skp_v = epi_tid + cutlass.Int32(128 * skp_i)
+                skp_r = skp_v // cutlass.Int32(skp_vpr)
+                skp_j = skp_v - skp_r * cutlass.Int32(skp_vpr)
+                skp_t = sk_idx * cutlass.Int32(skp_rows) + skp_r
+                skp_tok = cutlass.Int64(n_idx) * cutlass.Int64(
+                    self.cta_n
+                ) + cutlass.Int64(skp_t)
+                skp_feat = cutlass.Int64(m_idx) * cutlass.Int64(
+                    self.cta_m
+                ) + cutlass.Int64(skp_j) * cutlass.Int64(8)
+                skp_ok = cutlass.Int32(skp_v < cutlass.Int32(skp_nvec)) * cutlass.Int32(
+                    skp_tok < push_rows
+                )
+                skp_own_a = skp_base + (
+                    skp_t * cutlass.Int32(self.cta_m) + skp_j * cutlass.Int32(8)
+                ) * cutlass.Int32(4)
+                skp_addrs = []
+                for skp_z in cutlass.range_constexpr(self.split_k):
+                    skp_own = cutlass.Int32(sk_idx == cutlass.Int32(skp_z))
+                    skp_peer_a = (
+                        skp_recv
+                        + cutlass.Int32(skp_z * skp_blk)
+                        + (skp_r * cutlass.Int32(self.cta_m) + skp_j * cutlass.Int32(8))
+                        * cutlass.Int32(4)
+                    )
+                    skp_addrs.append(
+                        skp_own * skp_own_a + (cutlass.Int32(1) - skp_own) * skp_peer_a
+                    )
+                _push_reduce_vector(
+                    self.split_k,
+                    self.push_mode == 7,
+                    skp_addrs,
+                    skp_dst + (skp_tok * push_ldc + skp_feat) * cutlass.Int64(2),
+                    skp_ok,
+                )
+            if epi_tid == cutlass.Int32(0):
+                _asm0("cp.async.bulk.wait_group.read 0;")
+        if cutlass.const_expr(self.sk_cluster and not self.sk_push):
+            # Cluster split-K: stage this CTA's fp32 fragment in its B stage buffers (row-major per kernel-N row, pitch
+            # cta_m + 4; last accessed by the async proxy), copy it to the workspace, meet the cluster (release /
+            # acquire), then reduce this CTA's rows over the split_k copies in z order and store each bf16 vector.
+            skc_pitch = self.cta_m + 4
+            skc_base = cutlass.Int32(sB.iterator.toint())
+            sP = cute.make_tensor(
+                cute.make_ptr(
+                    self.acc_dtype, skc_base, cute.AddressSpace.smem, assumed_align=128
+                ),
+                cute.make_layout((self.cta_m, self.cta_n), stride=(1, skc_pitch)),
+            )
+            sP_epi = cute.flat_divide(sP, epi_tile)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute_ext.partition_and_copy(thr_t2r, rAcc, sP_epi[None, None, 0, 0])
+            # all of this CTA's staged rows to the workspace, 16-byte vectors, consecutive threads along a row
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            skc_gx, _, _ = cute.arch.grid_dim()
+            skc_tile = cutlass.Int64(n_idx) * cutlass.Int64(skc_gx) + cutlass.Int64(
+                m_idx
+            )
+            skc_row_bytes = self.cta_m * 4
+            skc_ws = cutlass.Int64(mMeta[21]) + (
+                skc_tile * cutlass.Int64(self.split_k) + cutlass.Int64(sk_idx)
+            ) * cutlass.Int64(self.cta_n * skc_row_bytes)
+            skc_out_vpr = self.cta_m // 4
+            for skc_o in cutlass.range_constexpr(
+                (self.cta_n * skc_out_vpr + 127) // 128
+            ):
+                skc_ov = epi_tid + cutlass.Int32(128 * skc_o)
+                skc_orow = skc_ov // cutlass.Int32(skc_out_vpr)
+                skc_oc = skc_ov - skc_orow * cutlass.Int32(skc_out_vpr)
+                _stage_out_vector(
+                    skc_base
+                    + (skc_orow * cutlass.Int32(skc_pitch) + skc_oc * cutlass.Int32(4))
+                    * cutlass.Int32(4),
+                    skc_ws
+                    + cutlass.Int64(skc_orow) * cutlass.Int64(skc_row_bytes)
+                    + cutlass.Int64(skc_oc) * cutlass.Int64(16),
+                )
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            skc_rows = self.cta_n // self.split_k
+            skc_vpr = self.cta_m // 8
+            skc_nvec = skc_rows * skc_vpr
+            if cutlass.const_expr(self.push_mode == 7):
+                skc_dst = push_peers[0]
+            else:
+                skc_dst = push_out
+            for skc_i in cutlass.range_constexpr((skc_nvec + 127) // 128):
+                skc_v = epi_tid + cutlass.Int32(128 * skc_i)
+                skc_t = sk_idx * cutlass.Int32(skc_rows) + skc_v // cutlass.Int32(
+                    skc_vpr
+                )
+                skc_j = skc_v - (skc_v // cutlass.Int32(skc_vpr)) * cutlass.Int32(
+                    skc_vpr
+                )
+                skc_tok = cutlass.Int64(n_idx) * cutlass.Int64(
+                    self.cta_n
+                ) + cutlass.Int64(skc_t)
+                skc_feat = cutlass.Int64(m_idx) * cutlass.Int64(
+                    self.cta_m
+                ) + cutlass.Int64(skc_j) * cutlass.Int64(8)
+                skc_ok = cutlass.Int32(skc_v < cutlass.Int32(skc_nvec)) * cutlass.Int32(
+                    skc_tok < push_rows
+                )
+                skc_src = (
+                    cutlass.Int64(mMeta[21])
+                    + skc_tile
+                    * cutlass.Int64(self.split_k * self.cta_n * skc_row_bytes)
+                    + cutlass.Int64(skc_t) * cutlass.Int64(skc_row_bytes)
+                    + cutlass.Int64(skc_j) * cutlass.Int64(32)
+                )
+                _l2_reduce_vector(
+                    self.split_k,
+                    self.push_mode == 7,
+                    skc_src,
+                    skc_dst + (skc_tok * push_ldc + skc_feat) * cutlass.Int64(2),
+                    skc_ok,
+                    cutlass.Int64(self.cta_n * skc_row_bytes),
+                )
         # Add bias in fp32 before the dtype cast.
         if cutlass.const_expr(self.has_bias):
             rAcc.store(rAcc.load() + rBiasAcc.load())
@@ -1395,9 +2090,9 @@ class TgvGemmCuteExtKernel:
         # stay untouched. So the C++ / vanilla-DSL kernels' explicit predicate
         # dance (make_identity_tensor + elem_less + basic_copy_if) isn't
         # needed; the explicit `predicated_tensor_origin` marker isn't either.
-        if cutlass.const_expr(self.push_mode == 0):
+        if cutlass.const_expr(self.push_mode == 0 and self.split_k == 1):
             cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
-        else:
+        elif cutlass.const_expr(not self.sk_cluster):
             # Restage the tile in the A stage buffers (row-major per kernel-N row, padded pitch). They were last
             # accessed by the async proxy (TMA writes, MMA reads, all complete once bar_mma_epilog completed); order
             # those accesses before the generic-proxy writes.
@@ -1416,6 +2111,9 @@ class TgvGemmCuteExtKernel:
             pitch = self.cta_m + 8
             vecs_per_row = self.cta_m // 8
             n_vec = self.cta_n * vecs_per_row
+            rows_lim = push_rows
+            if cutlass.const_expr(self.split_k > 1):
+                rows_lim = push_rows * cutlass.Int64(sk_flag[0])
             for i in cutlass.range_constexpr((n_vec + 127) // 128):
                 v = epi_tid + cutlass.Int32(128 * i)
                 t = v // cutlass.Int32(vecs_per_row)
@@ -1427,7 +2125,7 @@ class TgvGemmCuteExtKernel:
                     j
                 ) * cutlass.Int64(8)
                 if v < cutlass.Int32(n_vec):
-                    if tok < push_rows:
+                    if tok < rows_lim:
                         s_addr = s_base + (
                             t * cutlass.Int32(pitch) + j * cutlass.Int32(8)
                         ) * cutlass.Int32(2)
@@ -1435,6 +2133,8 @@ class TgvGemmCuteExtKernel:
                         addrs, flags = [], []
                         if cutlass.const_expr(self.push_mode == 7):
                             _publish_vector(s_addr, push_peers[0] + goff)
+                        elif cutlass.const_expr(self.push_mode == 0):
+                            _copy_vector(s_addr, push_out + goff)
                         elif cutlass.const_expr(self.push_mode == 1):
                             for d in cutlass.range_constexpr(self.push_world):
                                 addrs.append(push_peers[d] + goff)
@@ -1465,7 +2165,9 @@ class TgvGemmCuteExtKernel:
                                     cutlass.Int32(owner == cutlass.Int32(d))
                                     * cutlass.Int32(push_rank != cutlass.Int32(d))
                                 )
-                        if cutlass.const_expr(self.push_mode != 7):
+                        if cutlass.const_expr(
+                            self.push_mode != 7 and self.push_mode != 0
+                        ):
                             _push_vector(s_addr, push_out + goff, addrs, flags)
 
     # ====================================================================
@@ -1644,6 +2346,11 @@ def _get_compiled_cute_ext_kernel(
     push_world: int = 1,
     test_drop_restage_barrier: bool = False,
     test_trigger_before_copy: bool = False,
+    split_k: int = 1,
+    test_sk_delay: bool = False,
+    sk_cluster: bool = False,
+    sk_push: bool = False,
+    test_push_delay: int = 0,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1669,6 +2376,11 @@ def _get_compiled_cute_ext_kernel(
         int(push_world),
         bool(test_drop_restage_barrier),
         bool(test_trigger_before_copy),
+        int(split_k),
+        bool(test_sk_delay),
+        bool(sk_cluster),
+        bool(sk_push),
+        int(test_push_delay),
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1698,6 +2410,11 @@ def _get_compiled_cute_ext_kernel(
         push_world=push_world,
         test_drop_restage_barrier=test_drop_restage_barrier,
         test_trigger_before_copy=test_trigger_before_copy,
+        split_k=split_k,
+        test_sk_delay=test_sk_delay,
+        sk_cluster=sk_cluster,
+        sk_push=sk_push,
+        test_push_delay=test_push_delay,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1710,7 +2427,7 @@ def _get_compiled_cute_ext_kernel(
     )
     fake_stream = make_fake_stream()
 
-    if push_mode:
+    if push_mode or split_k > 1:
         meta_ = from_dlpack(
             torch.zeros((PUSH_META_LEN,), dtype=torch.int64, device="cuda"),
             assumed_align=16,
@@ -2027,6 +2744,8 @@ def _tgv_bf16_gemm_out_fake(
 PUSH_META_LEN = 24  # [0] counter [1] phase stride [2] rank [3] rows [4] owner chunk [5] out [6] ldc [7] ready flags
 #                     [8, 8 + W) peer slot bases [16] consumer grid (ready flags to set)
 #                     [17] copy source (residual) [18] copy destination [19] copy bytes [20] phase word (mode 5)
+#                     [21] split-K fragment workspace (fp32) [22] split-K tile counters (int32, all 0 between calls)
+#                     [23] test builds only: split-K delay seed
 PUSH_META_PEERS = (
     8  # meta[8 + d] = destination d's slot base for this rank as source (phase 0)
 )
@@ -2046,9 +2765,24 @@ def make_push_meta(
     copy_dst: int = 0,
     copy_bytes: int = 0,
     phase_out: int = 0,
+    sk_workspace: Optional[torch.Tensor] = None,
+    sk_counters: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """int64 argument block for the push epilogue (host-built once per buffer set; graph replays reuse it)."""
     vals = [0] * PUSH_META_LEN
+    if sk_workspace is not None:
+        assert (
+            sk_workspace.dtype == torch.float32
+            and sk_workspace.is_contiguous()
+            and sk_workspace.data_ptr() % 16 == 0
+        )
+        assert (
+            sk_counters is not None
+            and sk_counters.dtype == torch.int32
+            and sk_counters.is_contiguous()
+        )
+        vals[21] = int(sk_workspace.data_ptr())
+        vals[22] = int(sk_counters.data_ptr())
     vals[0] = int(counter_addr)
     vals[1] = int(phase_stride)
     vals[2] = int(rank)
@@ -2066,7 +2800,22 @@ def make_push_meta(
         vals[PUSH_META_PEERS + d] = int(base)
     t = torch.tensor(vals, dtype=torch.int64, device=out.device)
     _META_HOST[t.data_ptr()] = vals
+    if sk_workspace is not None:
+        _SK_HOST[t.data_ptr()] = (sk_workspace.numel(), sk_counters.numel())
     return t
+
+
+_SK_HOST: dict = {}  # meta device address -> (workspace floats, counters) of its split-K buffers
+
+
+def split_k_sizes(m: int, n: int, tactic: int, split_k: int) -> Tuple[int, int]:
+    """(fp32 workspace values, int32 tile counters) one split-K call of out[m, n] needs with this tactic."""
+    cta_m, cta_n, _, use_2cta = _resolve_tactic(tactic)
+    gx = -(n // -cta_m)
+    if use_2cta:
+        gx += gx % 2
+    gy = -(m // -cta_n)
+    return gx * gy * split_k * cta_m * cta_n, gx * gy
 
 
 _META_HOST: dict = {}  # meta device address -> its host values (graph replays reuse the device block unchanged)
@@ -2107,9 +2856,15 @@ def run_tgv(
     meta: Optional[torch.Tensor] = None,
     _test_drop_restage_barrier: bool = False,
     _test_trigger_before_copy: bool = False,
+    split_k: int = 1,
+    _test_sk_delay: bool = False,
+    sk_cluster: bool = False,
+    sk_push: bool = False,
+    _test_push_delay: int = 0,
 ) -> torch.Tensor:
     """out[M, N] = x[M, K] @ weight[N, K].T with this module's kernel; push_mode 1 / 2 also stores the tile into the
-    peer slots described by ``meta`` (make_push_meta). tactic None = the served pick (_pick_tactic)."""
+    peer slots described by ``meta`` (make_push_meta). tactic None = the served pick (_pick_tactic). split_k > 1 (push
+    modes 0 and 7) needs ``meta`` built with split-K buffers of at least split_k_sizes(...)."""
     assert (
         x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
@@ -2121,12 +2876,32 @@ def run_tgv(
         tactic = _pick_tactic(m, n, weight.shape[1])
     if m == 0:
         return out
-    if not push_mode:
+    if not push_mode and split_k == 1:
         return _run_tgv(x, weight.t(), None, out, pdl=pdl, tactic=tactic)
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     assert (
         meta is not None and meta.dtype == torch.int64 and meta.numel() == PUSH_META_LEN
     )
+    if split_k > 1:
+        if push_mode not in (0, 7):
+            raise ValueError("split_k > 1 supports push_mode 0 and 7 only")
+        if weight.shape[1] % (_TGV_CUTE_EXT_CTA_K * split_k):
+            raise ValueError(
+                f"split_k={split_k}: K={weight.shape[1]} is not a multiple of {_TGV_CUTE_EXT_CTA_K * split_k}"
+            )
+        need = split_k_sizes(m, n, tactic, split_k)
+        have = _SK_HOST.get(meta.data_ptr())
+        if have is None or have[0] < need[0] or have[1] < need[1]:
+            raise ValueError(
+                f"split_k={split_k}: meta has no split-K buffers of at least {need}"
+            )
+        host = _META_HOST[meta.data_ptr()]
+        if push_mode == 0 and (
+            host[5] != out.data_ptr() or host[6] != out.stride(0) or host[3] != m
+        ):
+            raise ValueError(
+                "split_k plain output: meta must describe this output (out, row pitch, rows)"
+            )
     if push_mode in (5, 6):
         if not pdl:
             raise ValueError("push_mode 5 / 6 needs a PDL launch")
@@ -2143,9 +2918,18 @@ def run_tgv(
                 "push_mode 5 / 6: copy block must be M x N fp32 (16-byte multiple) with source, copy and phase"
             )
     assert n % cta_m == 0, "push epilogue needs whole feature tiles"
-    a_, b_, c_, _, (a_leading, b_leading, c_leading) = _to_cute_swap(
-        x, weight.t(), out, None
-    )
+    if split_k > 1:
+        # K-chunk views: [split_k, rows, K / split_k] (chunk z = columns [z * K / split_k, (z + 1) * K / split_k)).
+        kz = weight.shape[1] // split_k
+        xv = x.unflatten(1, (split_k, kz)).permute(1, 0, 2)
+        wv = weight.unflatten(1, (split_k, kz)).permute(1, 0, 2)
+        a_, b_, c_, _, (a_leading, b_leading, c_leading) = _to_cute_swap(
+            xv, wv.transpose(-2, -1), out.unsqueeze(0), None
+        )
+    else:
+        a_, b_, c_, _, (a_leading, b_leading, c_leading) = _to_cute_swap(
+            x, weight.t(), out, None
+        )
     compiled = _get_compiled_cute_ext_kernel(
         dtype=x.dtype,
         c_dtype=out.dtype,
@@ -2163,6 +2947,11 @@ def run_tgv(
         push_world=push_world,
         test_drop_restage_barrier=_test_drop_restage_barrier,
         test_trigger_before_copy=_test_trigger_before_copy,
+        split_k=split_k,
+        test_sk_delay=_test_sk_delay,
+        sk_cluster=sk_cluster,
+        sk_push=sk_push,
+        test_push_delay=_test_push_delay,
     )
     meta_ = from_dlpack(meta, assumed_align=16)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)

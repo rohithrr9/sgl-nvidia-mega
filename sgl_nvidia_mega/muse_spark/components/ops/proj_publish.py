@@ -21,6 +21,13 @@ every user of the plane does. Results equal the stock pair "replicated GEMM + st
 summation order where the slice GEMM and the replicated GEMM differ, and (b) the sign of exact-zero projection outputs
 (the empty-marker remap), which SGLang's all-gather path shares at 306ccf6 (from 3117f58 it remaps only an all-zero
 32-bit word).
+
+Split-K publish (``publish_gemm(..., split_k=S, sk_cluster=...)``, ``sk_config``): the slice GEMM's K tiles are divided
+over S CTAs per output tile; the fp32 fragments meet in one workspace per (device, slice width), shared by every call
+(calls on one stream run one after another), and are summed in split order before the publish (by the last CTA of the
+tile, or with sk_cluster by every CTA of the tile's cluster for its share of the rows). The sum order depends on the row
+count only (same on every rank and every call). ``sk2_config``: the same exchange on 2-CTA tile pairs (a pair covers 128
+output features and one CTA loads half of the pair's rows), half the CTAs of the 1-CTA form at the same split count.
 """
 
 from __future__ import annotations
@@ -136,9 +143,71 @@ def step_aside_reason(comm, num_tokens: int, n_full: int, k: int) -> Optional[st
     return None
 
 
-_meta: Dict[Tuple[int, int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+_meta: Dict[Tuple[int, int, int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 _carriers: Dict[Tuple[int, int], torch.Tensor] = {}
+_sk_bufs: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 _MAX_ROWS = 512
+
+# Split-K publish configs: (largest row count, opp_tgv_gemm tactic or None = single pass, split_k, cluster exchange, push
+# exchange), first match wins. 1-CTA 64 x 64 tiles with 5 stages, 4 splits, cluster push exchange: 64 CTAs up to 64 rows,
+# 128 CTAs for 96-128 rows; 65-95 rows keep the single pass (a second, mostly empty row tile).
+SK_TABLE = (
+    (64, 35, 4, True, True),
+    (95, None, 1, False, False),
+    (128, 35, 4, True, True),
+)
+# 2-CTA tile-pair split-K publish configs: (largest row count, opp_tgv_gemm tactic, split_k), first match wins. Tile pairs of
+# 128 features x 64 / 128 / 192 / 256 rows, 4 splits, cluster (2, 1, 4) push exchange: 64 CTAs for a 4096-wide slice.
+SK2_TABLE = (
+    (64, 36, 4),
+    (128, 37, 4),
+    (192, 38, 4),
+    (256, 39, 4),
+)
+SK2_MAX_ROWS = SK2_TABLE[-1][0]
+SK_MAX_ROWS = max(SK_TABLE[-1][0], SK2_MAX_ROWS)  # rows any split-K publish form covers
+
+
+def sk_config(m: int) -> Optional[Tuple[int, int, bool, bool]]:
+    """(tactic, split_k, cluster exchange, push exchange) of the split-K publish GEMM at ``m`` rows, or None where the
+    single pass is kept (m <= SK_TABLE[-1][0])."""
+    for hi, tactic, s, cluster, push in SK_TABLE:
+        if m <= hi:
+            return None if tactic is None else (tactic, s, cluster, push)
+    raise RuntimeError(f"proj_publish: no split-K config for {m} rows")
+
+
+def sk2_config(m: int) -> Tuple[int, int, bool, bool]:
+    """(tactic, split_k, cluster exchange, push exchange) of the 2-CTA tile-pair split-K publish GEMM at ``m`` rows."""
+    for hi, tactic, s in SK2_TABLE:
+        if m <= hi:
+            return (tactic, s, True, True)
+    raise RuntimeError(f"proj_publish: no 2-CTA split-K config for {m} rows")
+
+
+def _sk_buffers(device: torch.device, n_slice: int):
+    """The split-K workspace and tile counters of (device, slice width), sized once for every row count of SK_TABLE and
+    SK2_TABLE (the push exchange forms never touch them; the run checks their size for every split-K call)."""
+    from .. import opp_tgv_gemm as g
+
+    key = (device.index or 0, n_slice)
+    hit = _sk_bufs.get(key)
+    if hit is None:
+        ws_n = cnt_n = 0
+        for m in range(1, SK_MAX_ROWS + 1):
+            cfgs = [sk2_config(m)] if m <= SK2_MAX_ROWS else []
+            if m <= SK_TABLE[-1][0]:
+                cfgs.append(sk_config(m))
+            for cfg in cfgs:
+                if cfg is not None:
+                    a, b = g.split_k_sizes(m, n_slice, cfg[0], cfg[1])
+                    ws_n, cnt_n = max(ws_n, a), max(cnt_n, b)
+        hit = (
+            torch.empty(ws_n, dtype=torch.float32, device=device),
+            torch.zeros(cnt_n, dtype=torch.int32, device=device),
+        )
+        _sk_bufs[key] = hit
+    return hit
 
 
 def _carrier(device: torch.device, n_slice: int, m: int) -> torch.Tensor:
@@ -184,12 +253,26 @@ def pending(comm):
     return _pending.get(id(comm))
 
 
-def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
-    """(dummy output [m, n_slice], int64 argument block) of a push_mode 7 GEMM, cached per (device, m, n_slice, plane)."""
+def note_publish(comm, site: str, m: int, n_full: int) -> None:
+    """For a producer other than ``publish_gemm``: record its publish of an [m, n_full] projection for the consumer ``site``
+    ("ag_norm" or "norm_fp4_quant"), before its launch, so the pairing rule covers it. Such a producer must store exactly
+    what ``publish_gemm`` stores: after its dependency wait, the phase = bit 0 of the high 32-bit half of the lease's
+    EpochCounter word (``control.epoch``); this rank's [m, n_full / world] block at byte offset
+    phase * world * capacity.push_slot_bytes + rank * m * (n_full / world) * 2 of the lease's multicast address
+    (``data.push_mc``); 16-byte vectors with every all-zero 16-bit half sent as 0x8000; one multimem.st.relaxed.sys
+    .global.v4.f32 per vector; every element of the block written once; no counter written."""
+    _begin(comm, site, m, n_full)
+
+
+def _publish_meta(
+    comm, m: int, n_slice: int, device: torch.device, split_k: bool = False
+):
+    """(dummy output [m, n_slice], int64 argument block) of a push_mode 7 GEMM, cached per (device, m, n_slice, plane,
+    split-K or not)."""
     from .. import opp_tgv_gemm as g
 
     push_mc = int(comm.data.push_mc)  # multicast VA of the push slots (has_multicast)
-    key = (device.index or 0, m, n_slice, push_mc)
+    key = (device.index or 0, m, n_slice, push_mc, int(split_k))
     hit = _meta.get(key)
     if hit is None:
         if torch.cuda.is_current_stream_capturing():
@@ -198,6 +281,7 @@ def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
             )
         w = comm.world_size
         out = _carrier(device, n_slice, m)  # shape carrier only (no plain stores)
+        ws, cnt = _sk_buffers(device, n_slice) if split_k else (None, None)
         meta = g.make_push_meta(
             # the plane's phase word is one u64 EpochCounter: the phase is bit 0 of its high (second) 32-bit half,
             # which the GEMM reads as a b32 word (& 1)
@@ -208,6 +292,8 @@ def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
             chunk_rows=0,
             out=out,
             peer_slot_bases=[push_mc + comm.rank * m * n_slice * 2],
+            sk_workspace=ws,
+            sk_counters=cnt,
         )
         hit = (out, meta)
         _meta[key] = hit
@@ -215,11 +301,19 @@ def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
 
 
 def publish_gemm(
-    comm, x: torch.Tensor, weight: torch.Tensor, site: str, tactic: Optional[int] = None
+    comm,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    site: str,
+    tactic: Optional[int] = None,
+    split_k: int = 1,
+    sk_cluster: bool = False,
+    sk_push: bool = False,
 ) -> None:
     """Publish this rank's column block of ``x @ weight.T`` (``weight`` = the full replicated [N, K]) into the gather slot
     of the current phase on every rank. ``site`` ("ag_norm" or "norm_fp4_quant") names the consumer, which must be the
-    next user of the plane."""
+    next user of the plane. ``split_k`` > 1: the split-K GEMM (``tactic`` required; ``sk_config`` / ``sk2_config`` give
+    the served configs, rows <= SK_MAX_ROWS)."""
     from .. import opp_tgv_gemm as g
 
     assert (
@@ -236,9 +330,24 @@ def publish_gemm(
     w = comm.world_size
     n_slice = n // w
     w_slice = weight[comm.rank * n_slice : (comm.rank + 1) * n_slice]
-    out, meta = _publish_meta(comm, m, n_slice, x.device)
+    if split_k > 1 and (tactic is None or m > SK_MAX_ROWS):
+        raise ValueError(
+            "proj_publish: split_k > 1 needs an explicit tactic and rows <= SK_MAX_ROWS"
+        )
+    out, meta = _publish_meta(comm, m, n_slice, x.device, split_k > 1)
     _begin(comm, site, m, n)
-    g.run_tgv(x, w_slice, out, tactic=tactic, push_mode=7, push_world=w, meta=meta)
+    g.run_tgv(
+        x,
+        w_slice,
+        out,
+        tactic=tactic,
+        push_mode=7,
+        push_world=w,
+        meta=meta,
+        split_k=split_k,
+        sk_cluster=sk_cluster,
+        sk_push=sk_push,
+    )
 
 
 def pub_ag_norm(

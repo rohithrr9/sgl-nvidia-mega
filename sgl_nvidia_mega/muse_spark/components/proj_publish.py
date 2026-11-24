@@ -15,7 +15,10 @@ gather slot (``ops/proj_publish.py``):
 - site ``U`` (unpooler; ``MUSE_VR_PROJ_PUBLISH_SITES=P,U``), rows ``MUSE_VR_PROJ_PUBLISH_U_ROWS`` (default ``192-288``):
   SGLang's deferred path is taken (``gemm_ag_supported`` admits this device for the unpooler only); its ``gemm_local`` call
   becomes ``publish_gemm`` and the FFN boundary's ``all_gather_norm_residual`` call becomes the consumer-only
-  ``pub_ag_norm`` (SGLang's boundary arithmetic without its push of a local slice). Rows in
+  ``pub_ag_norm`` (SGLang's boundary arithmetic without its push of a local slice). Pooler rows in
+  ``MUSE_VR_PROJ_PUBLISH_SK_ROWS`` (default none) publish through the split-K slice GEMM (``ops.proj_publish.sk_config``),
+  rows in ``MUSE_VR_PROJ_PUBLISH_SK2_ROWS`` (default none; takes precedence) through its 2-CTA tile-pair form
+  (``ops.proj_publish.sk2_config``); other rows keep the single-pass slice GEMM. Unpooler rows in
   ``MUSE_VR_PROJ_PUBLISH_UAG_ROWS`` (default none) take SGLang's own gathered unpooler path unchanged (sliced GEMM + its
   all-gather boundary), the form that measured faster than the publish at some row counts.
 
@@ -28,7 +31,8 @@ Numerics: the unpooler's TGV column-slice GEMM is bitwise equal to the replicate
 and the published values reach the boundary through SGLang's all-gather marker rule (an exact +0.0 half arrives as -0.0),
 as SGLang's own gathered path does at 306ccf6 (from 3117f58 SGLang's own path remaps only an all-zero 32-bit word). The
 pooler's slice GEMM differs from the replicated cuBLAS GEMM in summation order below 136 rows on this image (a
-reduction-order class) and is bitwise above (units).
+reduction-order class) and is bitwise above (units). The split-K slice GEMM differs from it in summation order at every
+row count (a reduction-order class; fixed split order, rank- and call-invariant).
 
 Plane: the Muse Spark collectives' lease on the tensor-parallel symmetric workspace (``muse_workspace()``) and its
 EpochCounter phase word (SGLang 3117f58 + #48948); the 306ccf6 form (the TP custom all-reduce's push plane with per-block
@@ -68,6 +72,8 @@ NAME = "proj_publish"
 ROWS_ENV = "MUSE_VR_PROJ_PUBLISH_ROWS"  # pooler (site P) rows
 U_ROWS_ENV = "MUSE_VR_PROJ_PUBLISH_U_ROWS"  # unpooler (site U) rows
 UAG_ROWS_ENV = "MUSE_VR_PROJ_PUBLISH_UAG_ROWS"  # unpooler rows on SGLang's own gathered path (no publish); default none
+SK_ROWS_ENV = "MUSE_VR_PROJ_PUBLISH_SK_ROWS"  # pooler rows on the split-K publish GEMM; default none
+SK2_ROWS_ENV = "MUSE_VR_PROJ_PUBLISH_SK2_ROWS"  # pooler rows on the 2-CTA tile-pair split-K publish GEMM; default none
 SITES_ENV = "MUSE_VR_PROJ_PUBLISH_SITES"
 DEFAULT_ROWS = (56, 336)
 DEFAULT_U_ROWS = (192, 288)
@@ -123,6 +129,8 @@ _state = {
     "rows": DEFAULT_ROWS,
     "u_rows": DEFAULT_U_ROWS,
     "uag_rows": None,
+    "sk_rows": None,
+    "sk2_rows": None,
     "sites": ("P",),
     "markers": {},
     "allow_p": None,
@@ -243,7 +251,27 @@ def install() -> None:
             comm = _comm()
             r = publishable(comm, x, weight, (EH, H), _state["rows"])
             if r is None:
-                pp.publish_gemm(comm, x.contiguous(), weight, "norm_fp4_quant")
+                if _in(_state["sk2_rows"], x.shape[0]):
+                    cfg, tag = pp.sk2_config(x.shape[0]), "split-K pair"
+                elif _in(_state["sk_rows"], x.shape[0]):
+                    cfg, tag = pp.sk_config(x.shape[0]), "split-K"
+                else:
+                    cfg, tag = None, None
+                if cfg is not None:
+                    tactic, split_k, cluster, push = cfg
+                    pp.publish_gemm(
+                        comm,
+                        x.contiguous(),
+                        weight,
+                        "norm_fp4_quant",
+                        tactic=tactic,
+                        split_k=split_k,
+                        sk_cluster=cluster,
+                        sk_push=push,
+                    )
+                    bed.count(NAME, f"P publish {tag} M{x.shape[0]}")
+                else:
+                    pp.publish_gemm(comm, x.contiguous(), weight, "norm_fp4_quant")
                 bed.count(NAME, f"P publish M{x.shape[0]}")
                 bed.count(
                     NAME, f"P layer {_state.get('layer', -1)}"
@@ -353,19 +381,33 @@ def register() -> bool:
         _state["rows"] = _range(ROWS_ENV, DEFAULT_ROWS)
         _state["u_rows"] = _range(U_ROWS_ENV, DEFAULT_U_ROWS)
         _state["uag_rows"] = _range(UAG_ROWS_ENV, None)
+        _state["sk_rows"] = _range(SK_ROWS_ENV, None)
+        _state["sk2_rows"] = _range(SK2_ROWS_ENV, None)
+        from .ops import proj_publish as _pp
+
+        if _state["sk_rows"] and _state["sk_rows"][1] > _pp.SK_TABLE[-1][0]:
+            raise ValueError(
+                f"{SK_ROWS_ENV}: split-K publish covers rows <= {_pp.SK_TABLE[-1][0]}"
+            )
+        if _state["sk2_rows"] and _state["sk2_rows"][1] > _pp.SK2_MAX_ROWS:
+            raise ValueError(
+                f"{SK2_ROWS_ENV}: 2-CTA split-K publish covers rows <= {_pp.SK2_MAX_ROWS}"
+            )
         _state["sites"] = _sites()
         install()
     except Exception as e:  # noqa: BLE001
         bed.report(NAME, False, reason=f"install failed: {type(e).__name__}: {e}")
         _state["engaged"] = False
         return False
-    uag = _state["uag_rows"]
+    uag, sk, sk2 = _state["uag_rows"], _state["sk_rows"], _state["sk2_rows"]
     bed.report(
         NAME,
         True,
         p_rows="%d-%d" % _state["rows"],
         u_rows="%d-%d" % _state["u_rows"],
         uag_rows=("%d-%d" % uag) if uag else "none",
+        sk_rows=("%d-%d" % sk) if sk else "none",
+        sk2_rows=("%d-%d" % sk2) if sk2 else "none",
         sites=",".join(_state["sites"]),
     )
     _state["engaged"] = True
