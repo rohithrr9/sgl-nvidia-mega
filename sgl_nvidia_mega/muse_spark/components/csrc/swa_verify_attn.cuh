@@ -35,6 +35,12 @@
  * receiver waits on that mbarrier (acquire, cluster scope) and merges its rows. One cluster barrier at kernel
  * start (after the mbarrier initialization, fence.mbarrier_init.release.cluster) orders the initialization
  * before any remote store.
+ * With kExitBar (the default), a second cluster barrier keeps every block alive until the
+ * whole cluster has received its records: a block arrives (release, cluster scope) once its own receive mbarrier
+ * has completed and waits (acquire, cluster scope) at its end, so no block exits while a record it sent may still be
+ * in flight (CUDA Programming Guide, distributed shared memory: the program must ensure every distributed shared memory
+ * operation happens before a thread block exits; PTX ISA, barrier.cluster). The form without it
+ * (MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE=1, default off) is not guaranteed by the PTX memory model.
  *
  * With kNormGate, the finalizing block also applies the attention output norm and gate to its rows: with x the bf16
  * attention output of one (token, head) row, ss = fp32 sum of x^2 (each of the row's 16 threads sums its 4 values
@@ -492,12 +498,12 @@ __device__ __forceinline__ int new_key_warps(int k0, int nvalid, int tnew) {
 // wait. Same values: bitwise equal either way.
 // kKvSide (with kQk): the block gets kWarps more warps ("side warps"). Side warp kWarps + w computes the K/V rows of
 // the 8 new tokens that warp w computes without them (same rows, same arithmetic, same shared-memory and pool stores)
-// and then waits at the cluster barrier and leaves; the attention warps only compute the q rows, so the q release no
-// longer waits for the K/V rows.
+// and then waits at the cluster barrier (with kExitBar also at the exit barrier) and leaves; the attention warps only
+// compute the q rows, so the q release no longer waits for the K/V rows.
 // Only the warps whose keys include new tokens wait for those rows (named barrier 2, block-uniform thread count); the
 // block-wide barriers of the attention warps become named barrier 1 over those warps. Bitwise equal either way.
 template <int kChunk, int kSplit, int kRG, int kC, bool kUsePDL, bool kPrefetch, bool kNormGate, int kQk,
-          bool kRope, bool kUnfused, bool kStage, bool kEarlyTrigger = false, bool kGatePre = false,
+          bool kRope, bool kUnfused, bool kExitBar, bool kStage, bool kEarlyTrigger = false, bool kGatePre = false,
           bool kKvSide = false>
 __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads * (kKvSide ? 2 : 1))
     swa_verify_attn_kernel(const Params p) {
@@ -622,6 +628,12 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads * 
       // Leave only after the cluster wait: the attention warps' wait at the merge is compiled together with a barrier
       // over the whole block, which these warps then reach as well (no warp of the block has exited by then).
       asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+      // kExitBar: the attention warps' exit-barrier wait is such a cluster wait as well, so these warps arrive at the
+      // exit barrier too and leave only after it (they send no records).
+      if constexpr (kExitBar) {
+        asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+      }
       return;
     }
   }
@@ -957,6 +969,8 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads * 
   }
   if constexpr (kUsePDL && !kEarlyTrigger) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
   mbar_wait_phase0(bar);
+  // Exit barrier arrival: every record bound for this block has landed (the wait above).
+  if constexpr (kExitBar) asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
 
   // Finalize the rows this block owns (rank, rank + kC, ...), four output columns per item.
   for (int item = tid; item < nown * 16; item += C::kThreads) {
@@ -1001,12 +1015,15 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads * 
     *reinterpret_cast<uint2*>(p.out + ((static_cast<int64_t>(req) * kTokens + t) * p.num_q_heads + h) * kHeadDim +
                               4 * c4) = packed;
   }
+  // Exit barrier wait: every block of the cluster has received all of its records, those sent by this block included.
+  if constexpr (kExitBar) asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
 }
 
 }  // namespace swa
 
 template <int kChunk, int kSplit, int kRG, int kC, bool kUsePDL, bool kPrefetch, bool kNormGate, int kQk, bool kRope,
-          bool kUnfused, bool kStage = false, bool kEarlyTrigger = false, bool kGatePre = false, bool kKvSide = false>
+          bool kUnfused, bool kExitBar, bool kStage = false, bool kEarlyTrigger = false, bool kGatePre = false,
+          bool kKvSide = false>
 struct SwaVerifyAttnKernel {
   static void run(const tvm::ffi::TensorView q,           // kQk == 0: [R*8, Hq, 64] e4m3, heads/dims contiguous
                   const tvm::ffi::TensorView k_pool,      // [slots, Hkv*64] e4m3 bytes, rows contiguous
@@ -1117,7 +1134,7 @@ struct SwaVerifyAttnKernel {
 
     constexpr auto kernel =
         swa::swa_verify_attn_kernel<kChunk, kSplit, kRG, kC, kUsePDL, kPrefetch, kNormGate, kQk, kRope, kUnfused,
-                                    kStage, kEarlyTrigger, kGatePre, kKvSide>;
+                                    kExitBar, kStage, kEarlyTrigger, kGatePre, kKvSide>;
     static bool configured = false;
     if (!configured) {
       RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kBytes));

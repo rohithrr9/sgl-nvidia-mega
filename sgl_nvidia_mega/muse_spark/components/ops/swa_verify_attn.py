@@ -51,6 +51,15 @@ _NO_PDL_REQUESTS = frozenset()
 _NO_PDL_REQUESTS_QK = frozenset({1, 2, 3, 4})
 
 
+def exit_barrier() -> bool:
+    """Whether the kernel ends with its exit cluster barrier (see ``csrc/swa_verify_attn.cuh``): the default.
+    MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE=1 (default off) selects the form without it, which is not guaranteed by the PTX
+    memory model."""
+    return os.environ.get(
+        "MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE", "0"
+    ).strip().lower() not in ("1", "true", "yes", "on")
+
+
 def _env_set(name: str, default: frozenset) -> frozenset:
     raw = os.environ.get(name)
     if raw is None:
@@ -131,10 +140,23 @@ def _module(
     gate_pre: bool = False,
     unfused: bool = False,
     kv_side: bool = False,
+    exit_bar: bool = True,
 ):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    a = (kchunk, ksplit, krg, kc, use_pdl, prefetch, norm_gate, qk, rope, unfused)
+    a = (
+        kchunk,
+        ksplit,
+        krg,
+        kc,
+        use_pdl,
+        prefetch,
+        norm_gate,
+        qk,
+        rope,
+        unfused,
+        exit_bar,
+    )
     if kv_side:
         args = make_cpp_args(*a, stage, early, gate_pre, True)
     elif gate_pre:
@@ -220,6 +242,7 @@ def module_key(
         bool(norm_gate) and gate_pre_for(num_requests),
         qk_unfused(qk),
         bool(qk) and kv_side_for(num_requests),
+        exit_barrier(),
     )
 
 
@@ -418,6 +441,7 @@ def swa_verify_attn(
         gate is not None and gate_pre_for(reqs),
         qk_unfused(qk),
         kvs,
+        exit_barrier(),
     )
     mod = _module(*key)
     _loaded.add(key)

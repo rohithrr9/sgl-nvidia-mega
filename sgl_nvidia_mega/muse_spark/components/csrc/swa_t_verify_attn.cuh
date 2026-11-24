@@ -11,7 +11,8 @@
  * barrier, merges its rows' records in chunk order with the merge kernel's arithmetic below, applies the optional fused
  * output norm + gate (SGLang's norm_gate arithmetic, 16 threads per row) and writes bf16 rows. No merge kernel, no
  * global partials. A cluster barrier at entry (receive barriers initialised before any remote write) and, with bulk
- * records, one before exit (no CTA exits while a copy may still read its shared memory).
+ * records, one before exit (no CTA exits while a copy may still read its shared memory); with st.async records the same
+ * barrier before exit by default (kPf bit 524288: no CTA exits while a record it sent may still be in flight).
  *
  * QK prologue (kPf bits 16-17 = column class E 2 / 4 / 8; kPf bit 262144 = the unfused arithmetic form, below;
  * SwaTKernel::run_qk): the kernel takes the bf16 QKV projection
@@ -863,6 +864,12 @@ __global__ void __launch_bounds__(Layout<kPairs, kStages, kTpr>::kThreads, 1)
   // SWA-T global records (kPf bit 512): records go to the workspace (L2) like full_attn_wide's partials, one cluster
   // barrier (release / acquire) orders them before the owners read them; no DSMEM traffic
   constexpr bool kGRecT = kC > 0 && (kPf & 512) != 0;
+  // SWA-T st.async records with the exit cluster barrier (kPf bit 524288, the default): the
+  // barrier before exit of the bulk form, so that no CTA exits while a record it sent may still be in flight (CUDA
+  // Programming Guide, distributed shared memory: the program must ensure every distributed shared memory operation happens
+  // before a thread block exits). The form without it (MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE=1, default off) is not
+  // guaranteed by the PTX memory model.
+  constexpr bool kExitBarT = kC > 0 && !kBulkT && !kGRecT && (kPf & 524288) != 0;
   int pre_issued = 0;  // load warp lane 0: tiles issued before the wait
   if constexpr (kStageT) {
     if (warp == kSmWarps + 1) {
@@ -1955,9 +1962,10 @@ __global__ void __launch_bounds__(Layout<kPairs, kStages, kTpr>::kThreads, 1)
   __syncthreads();
   if (tid == 0) stamp(14, 0);
   if constexpr (kUsePDL && (kC == 0 || (kPf & 64) != 0)) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
-  if constexpr (kBulkT) {
-    // no CTA exits while a bulk copy may still read its shared memory: every owner has waited for all of its records
-    // (above) before it arrives here (split form: threads that have not waited on the entry phase do so first)
+  if constexpr (kBulkT || kExitBarT) {
+    // no CTA exits while a bulk copy may still read its shared memory (kBulkT) or a record it sent may still be in
+    // flight (kExitBarT): every owner has waited for all of its records (above) before it arrives here (split form:
+    // threads that have not waited on the entry phase do so first)
     if constexpr (kSplitCB)
       if (!(warp < kSmWarps && ntiles > 0)) asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
     asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");

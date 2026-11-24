@@ -49,6 +49,7 @@ PF_STAGE = 32
 PF_BULK = 256
 PF_QK = {2: 1 << 16, 4: 2 << 16, 8: 3 << 16}
 PF_QK_UNFUSED = 1 << 18  # the prologue's unfused arithmetic form
+PF_EXIT_BAR = 1 << 19  # st.async records: the exit cluster barrier (see _pf)
 # Arithmetic form of SGLang's fused QK-norm Triton kernel per (Triton release, FP-fusion default) the prologue was validated
 # against bit for bit (tests/test_swa_t.py): "fused" = with FP fusion (fma contractions, the mean as div.full), "unfused" =
 # without (every product and sum rounded separately, the mean as a product with div.approx(1, 64)). The Triton kernel is
@@ -63,7 +64,18 @@ def _pf() -> int:
     pf = PF_STAGE
     if os.environ.get("MUSE_VR_SWA_T_BULK", "0").strip() in ("1", "true", "yes", "on"):
         pf |= PF_BULK
+    elif exit_barrier():
+        pf |= PF_EXIT_BAR
     return pf
+
+
+def exit_barrier() -> bool:
+    """Whether the st.async record form ends with its exit cluster barrier (see ``csrc/swa_t_verify_attn.cuh``): the
+    default. MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE=1 (default off) selects the form without it, which is not guaranteed by
+    the PTX memory model."""
+    return os.environ.get(
+        "MUSE_VR_SWA_NO_EXIT_BARRIER_UNSAFE", "0"
+    ).strip().lower() not in ("1", "true", "yes", "on")
 
 
 # compute-sanitizer builds only: a small mbarrier poll cap (an instrumented wait that cannot complete traps within seconds),
