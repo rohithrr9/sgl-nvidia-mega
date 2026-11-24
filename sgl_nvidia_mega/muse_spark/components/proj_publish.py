@@ -18,7 +18,9 @@ gather slot (``ops/proj_publish.py``):
   ``pub_ag_norm`` (SGLang's boundary arithmetic without its push of a local slice). Pooler rows in
   ``MUSE_VR_PROJ_PUBLISH_SK_ROWS`` (default none) publish through the split-K slice GEMM (``ops.proj_publish.sk_config``),
   rows in ``MUSE_VR_PROJ_PUBLISH_SK2_ROWS`` (default none; takes precedence) through its 2-CTA tile-pair form
-  (``ops.proj_publish.sk2_config``); other rows keep the single-pass slice GEMM. Unpooler rows in
+  (``ops.proj_publish.sk2_config``); other rows keep the single-pass slice GEMM. Setting either also builds every 2-CTA
+  publish GEMM of the process with the MMA warp's wait for the TMEM-alloc barrier's first phase (``opp_tgv_gemm``,
+  ``_TMEM_ALLOC_WAIT``; the single-pass 2-CTA publishes included). Unpooler rows in
   ``MUSE_VR_PROJ_PUBLISH_UAG_ROWS`` (default none) take SGLang's own gathered unpooler path unchanged (sliced GEMM + its
   all-gather boundary), the form that measured faster than the publish at some row counts.
 

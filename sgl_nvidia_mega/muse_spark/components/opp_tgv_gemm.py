@@ -30,6 +30,9 @@
 # Modified by NVIDIA: the cluster split-K push exchange also runs on 2-CTA tile pairs: cluster (2, 1, split_k), the pair of
 # split z is cluster ranks (2 z, 2 z + 1), its even CTA issues the pair's MMAs and the pair's commits / peer arrives target
 # that pair; each CTA exchanges its own 64 output features with the CTAs of the same pair position in the other splits.
+# Modified by NVIDIA: in 2-CTA builds the MMA warp waits for the TMEM-alloc barrier's first phase before its second
+# arrive (the odd CTA issues no MMA), in the processes that set ``MUSE_VR_PROJ_PUBLISH_SK_ROWS`` or ``_SK2_ROWS``
+# (``_TMEM_ALLOC_WAIT``); other processes build the 2-CTA kernels without the wait.
 """CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
@@ -49,6 +52,7 @@ Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
 
 from __future__ import annotations
 
+import os
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -64,6 +68,8 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T
 from sglang.srt.utils import get_device_core_count, is_sm100_supported
 
+from .proj_publish import SK2_ROWS_ENV, SK_ROWS_ENV
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
     "srt/utils/*.py": ("get_device_core_count", "is_sm100_supported"),
@@ -76,6 +82,11 @@ SGLANG_READS = {
 _TGV_CUTE_EXT_CTA_K: int = 128
 _TGV_TMEM_COLS: int = (
     256  # TMEM columns each CTA allocates (alloc and every dealloc use this one value)
+)
+# The 2-CTA MMA warp's wait for the TMEM-alloc barrier's first phase is built in the processes that set either split-K
+# row knob of the projection publish (read once, at import, so every build of the process agrees)
+_TMEM_ALLOC_WAIT: bool = any(
+    os.environ.get(v, "").strip() for v in (SK_ROWS_ENV, SK2_ROWS_ENV)
 )
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
 _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
@@ -1398,6 +1409,10 @@ class TgvGemmCuteExtKernel:
         # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
         # cross-CTA handshake) because each CTA owns its own physical TMEM
         # half; the cluster-shared accumulator is just a logical view.
+        if cutlass.const_expr(self.use_2cta and _TMEM_ALLOC_WAIT):
+            # 2-CTA: the odd CTA's MMA warp issues no MMA, so without this wait its phase-1 arrive could land in phase 0
+            # (before the epilogue warps' phase-0 arrivals); wait for phase 0 first, so each phase gets its own arrivals.
+            cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         if cutlass.const_expr(not (self.use_2cta and self.sk_cluster)):
