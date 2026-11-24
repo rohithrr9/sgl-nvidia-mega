@@ -45,7 +45,16 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 #include <cstdint>
+
+// Optional in-kernel coins (Params::draw = 1): the two uniform draws of the accept path (uniform [bs, slots - 1], then
+// uniform_final [bs]) are computed here instead of by two torch.rand launches, bit for bit as torch.rand computes them
+// for these sizes: element e of a draw of n elements (n at most 256 x the launch's block count, so one element per
+// thread of torch's grid-stride kernel) is component x of curand_uniform4 on a Philox state initialised with
+// (seed, subsequence e, offset of that draw), with (0, 1] mapped to [0, 1) by sending 1 to 0. The caller reserves the
+// generator offsets exactly as the two torch.rand calls would and passes the seed and both draw offsets; the coins are
+// also stored to the two buffers.
 
 namespace muse_vr::sparse_final {
 
@@ -65,7 +74,7 @@ struct Params {
   int64_t s_cand_b, s_cand_s;
   const int64_t* retrive_index;
   int64_t s_idx_b, s_idx_s;
-  const float* uniform;
+  float* uniform;  // read, or written then read when draw = 1
   int64_t s_uni_b, s_uni_s;
   const float* top_probs;  // [bs * slots, K]
   const int64_t* top_ids;  // [bs * slots, K]
@@ -73,10 +82,20 @@ struct Params {
   int64_t s_ci_b, s_ci_s;
   const void* q_rows;
   int64_t s_q_b, s_q_s;
-  const float* uniform_final;
+  float* uniform_final;  // read, or written then read when draw = 1
   int64_t* bonus;
   int K, KQ, slots, vocab, tiles;
+  unsigned long long seed, off_a, off_b;  // draw = 1: generator seed, offsets of the two draws
+  int draw;
 };
+
+// One torch.rand element (float32, [0, 1)) for a draw at `offset`: see the header note above.
+SGL_DEVICE float torch_uniform(unsigned long long seed, unsigned long long subsequence, unsigned long long offset) {
+  curandStatePhilox4_32_10_t st;
+  curand_init(seed, subsequence, offset, &st);
+  const float r = curand_uniform4(&st).x;
+  return r == 1.0f ? 0.0f : r;
+}
 
 template <typename QT>
 SGL_DEVICE float q_load(const void* base, int64_t off) {
@@ -144,7 +163,17 @@ __global__ void __launch_bounds__(kThreads, 1) sparse_final_kernel(const __grid_
   for (int j = th; j < NS; j += kThreads) {
     s.cand[j] = p.candidates[pid * p.s_cand_b + j * p.s_cand_s];
     s.retr[j] = p.retrive_index[pid * p.s_idx_b + j * p.s_idx_s];
-    if (j + 1 < NS) s.uni[j] = p.uniform[pid * p.s_uni_b + j * p.s_uni_s];
+    if (j + 1 < NS) {
+      float* u = p.uniform + pid * p.s_uni_b + j * p.s_uni_s;
+      if (p.draw) {
+        // element pid * (slots - 1) + j of the contiguous [bs, slots - 1] draw
+        const float c = torch_uniform(p.seed, static_cast<unsigned long long>(pid) * (NS - 1) + j, p.off_a);
+        *u = c;
+        s.uni[j] = c;
+      } else {
+        s.uni[j] = *u;
+      }
+    }
   }
   for (int j = th; j < NS * K; j += kThreads) {
     const int r = j / K, c = j % K;
@@ -308,7 +337,14 @@ __global__ void __launch_bounds__(kThreads, 1) sparse_final_kernel(const __grid_
       s.cum[j] = norm;
       norm = __fadd_rn(norm, s.val[j]);
     }
-    s.target = __fmul_rn(p.uniform_final[pid], norm);
+    float uf;
+    if (p.draw) {
+      uf = torch_uniform(p.seed, static_cast<unsigned long long>(pid), p.off_b);  // element pid of the [bs] draw
+      p.uniform_final[pid] = uf;
+    } else {
+      uf = p.uniform_final[pid];
+    }
+    s.target = __fmul_rn(uf, norm);
   }
   __syncthreads();
   const float target = s.target;
@@ -421,13 +457,28 @@ __global__ void __launch_bounds__(kThreads, 1) sparse_final_kernel(const __grid_
   }
 }
 
+struct CoinParams {
+  float* u;
+  int64_t n_a;
+  float* u_final;
+  int64_t n_b;
+  unsigned long long seed, off_a, off_b;
+};
+
+__global__ void coins_kernel(const __grid_constant__ CoinParams c) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < c.n_a) c.u[i] = torch_uniform(c.seed, static_cast<unsigned long long>(i), c.off_a);
+  if (i < c.n_b) c.u_final[i] = torch_uniform(c.seed, static_cast<unsigned long long>(i), c.off_b);
+}
+
 struct SparseFinal {
   static void run(const tvm::ffi::TensorView predicts, const tvm::ffi::TensorView accept_index,
                   const tvm::ffi::TensorView accept_num, const tvm::ffi::TensorView candidates,
                   const tvm::ffi::TensorView retrive_index, const tvm::ffi::TensorView uniform,
                   const tvm::ffi::TensorView top_probs, const tvm::ffi::TensorView top_ids,
                   const tvm::ffi::TensorView cand_ids, const tvm::ffi::TensorView q_rows,
-                  const tvm::ffi::TensorView uniform_final, const tvm::ffi::TensorView bonus, int64_t vocab) {
+                  const tvm::ffi::TensorView uniform_final, const tvm::ffi::TensorView bonus, int64_t vocab,
+                  int64_t draw, int64_t seed, int64_t off_a, int64_t off_b) {
     using namespace host;
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
@@ -473,7 +524,7 @@ struct SparseFinal {
     p.retrive_index = static_cast<const int64_t*>(retrive_index.data_ptr());
     p.s_idx_b = SIB.unwrap();
     p.s_idx_s = SIS.unwrap();
-    p.uniform = static_cast<const float*>(uniform.data_ptr());
+    p.uniform = static_cast<float*>(uniform.data_ptr());
     p.s_uni_b = SUB.unwrap();
     p.s_uni_s = SUS.unwrap();
     p.top_probs = static_cast<const float*>(top_probs.data_ptr());
@@ -484,13 +535,20 @@ struct SparseFinal {
     p.q_rows = q_rows.data_ptr();
     p.s_q_b = SQB.unwrap();
     p.s_q_s = SQS.unwrap();
-    p.uniform_final = static_cast<const float*>(uniform_final.data_ptr());
+    p.uniform_final = static_cast<float*>(uniform_final.data_ptr());
     p.bonus = static_cast<int64_t*>(bonus.data_ptr());
     p.K = static_cast<int>(k);
     p.KQ = static_cast<int>(kq);
     p.slots = static_cast<int>(ns);
     p.vocab = static_cast<int>(vocab);
     p.tiles = static_cast<int>(tiles);
+    // draw = 1: the coins are drawn here; the [bs, slots - 1] buffer must be the contiguous tensor torch.rand would
+    // have returned (element index = row * (slots - 1) + column). The seed's 64 bits arrive as a signed integer.
+    RuntimeCheck(draw == 0 || (SUB.unwrap() == ns - 1 && SUS.unwrap() == 1), "drawn coins need a contiguous buffer");
+    p.draw = draw != 0 ? 1 : 0;
+    p.seed = static_cast<unsigned long long>(seed);
+    p.off_a = static_cast<unsigned long long>(off_a);
+    p.off_b = static_cast<unsigned long long>(off_b);
     const auto dev = device_.unwrap();
     const auto code = q_rows.dtype().code;
     const auto bits = q_rows.dtype().bits;
@@ -510,6 +568,30 @@ struct SparseFinal {
     } else {
       launch(sparse_final_kernel<__half>);
     }
+  }
+
+  // Self-check entry: the two draws alone (contiguous float32 [n_a] and [n_b]) with torch_uniform, the device function
+  // the fused kernel uses, so the caller can compare them with torch.rand at the same generator state.
+  static void coins(const tvm::ffi::TensorView u, const tvm::ffi::TensorView u_final, int64_t seed, int64_t off_a,
+                    int64_t off_b) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    auto NA = SymbolicSize{"n_a"};
+    auto NB = SymbolicSize{"n_b"};
+    TensorMatcher({NA}).with_dtype<float>().with_device(device_).verify(u);
+    TensorMatcher({NB}).with_dtype<float>().with_device(device_).verify(u_final);
+    const int64_t n = NA.unwrap() > NB.unwrap() ? NA.unwrap() : NB.unwrap();
+    if (n == 0) return;
+    CoinParams c{};
+    c.u = static_cast<float*>(u.data_ptr());
+    c.n_a = NA.unwrap();
+    c.u_final = static_cast<float*>(u_final.data_ptr());
+    c.n_b = NB.unwrap();
+    c.seed = static_cast<unsigned long long>(seed);
+    c.off_a = static_cast<unsigned long long>(off_a);
+    c.off_b = static_cast<unsigned long long>(off_b);
+    LaunchKernel(static_cast<unsigned>((n + 255) / 256), 256, device_.unwrap())(coins_kernel, c);
   }
 };
 

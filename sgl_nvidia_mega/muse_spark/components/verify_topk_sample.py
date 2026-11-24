@@ -47,6 +47,12 @@ with the stock functions, ``tests/dist_verify_topk_sample.py`` across ranks. ``M
 runs the walk and the final-token pass as one CUDA kernel (``csrc/sparse_final.cuh``: tile sums evaluated on the
 residual's nonzero entries with the stock reduction tree, only candidate tiles scanned, no dense residual row); same
 writes, same bits (``tests/test_verify_topk_sample.py``).
+``MUSE_VR_SPARSE_FINAL_COINS=1`` (default off; with ``MUSE_VR_SPARSE_FINAL=1``): that kernel also draws the accept
+path's two uniform tensors itself instead of two ``torch.rand`` launches, with the same values: the default CUDA
+generator's seed and offsets are read and advanced on the host exactly as the two ``torch.rand`` calls would advance
+them, at the same point of the step, and each element is computed as ``torch.rand``'s kernel computes it at these sizes
+(csrc/sparse_final.cuh). Eager calls only; under CUDA-graph capture, for draws too large for that element mapping, or
+when the fused kernel does not take the call, ``torch.rand`` runs as before (each decision is counted).
 
 Engaged only when every request samples with the same ``top_k`` in [2, 64], ``top_p`` 1, no penalties, logit bias,
 custom logit processor, grammar, logprobs or sampling-mask capture, the selector path without block verification,
@@ -1103,12 +1109,15 @@ def sparse_chain_sample(
     vocab: int,
     bonus=None,
     fused=None,
+    coins_rng=None,
 ):
     """Same writes to predicts / accept_index / accept_token_num as ``chain_speculative_sampling_triton`` (non-block
     verification) on the dense matrices that hold top_probs at top_ids (target) and q_rows at cand_ids (draft); with
     ``bonus`` (int64 [bs]) also the bonus tokens (``predicts[accept_index[i, accept_token_num[i]]]``). ``fused``: run the
     walk and the final-token pass as one CUDA kernel (csrc/sparse_final.cuh; same writes, same bits); None = from
-    ``MUSE_VR_SPARSE_FINAL`` (default off)."""
+    ``MUSE_VR_SPARSE_FINAL`` (default off). ``coins_rng`` = (seed, offset of the first draw, offset of the second) from
+    ``_reserve_coins``: the kernel draws ``uniform_samples`` / ``uniform_samples_final`` itself (the buffers are
+    written); the caller has checked that the fused kernel takes the call (``_coins_ok``)."""
     bs, num_slots = candidates.shape
     k = top_ids.shape[1]
     kq = cand_ids.shape[-1]
@@ -1117,7 +1126,7 @@ def sparse_chain_sample(
         bonus = torch.empty((bs,), dtype=torch.int64, device=dev)
     if fused is None:
         fused = bed.flag("sparse_final")
-    if fused and _sf_ok(
+    ok = bool(fused) and _sf_ok(
         predicts,
         accept_index,
         accept_token_num,
@@ -1131,7 +1140,16 @@ def sparse_chain_sample(
         q_rows,
         vocab,
         bonus,
-    ):
+    )
+    if coins_rng is not None and not ok:
+        # the generator offsets are already reserved for these coins: no other path may consume them
+        raise RuntimeError(
+            "sparse_chain_sample: in-kernel coins without the fused kernel"
+        )
+    if ok:
+        draw, seed, off_a, off_b = (
+            (1, *coins_rng) if coins_rng is not None else (0, 0, 0, 0)
+        )
         sf_module().run(
             predicts,
             accept_index,
@@ -1146,6 +1164,10 @@ def sparse_chain_sample(
             uniform_samples_final,
             bonus,
             int(vocab),
+            draw,
+            _signed64(seed),
+            off_a,
+            off_b,
         )
         if not torch.cuda.is_current_stream_capturing() and not _state.get(
             "in_preload"
@@ -1240,8 +1262,45 @@ def sf_module():
     return load_jit(
         "muse_vr_sparse_final",
         cuda_files=[str(_SF_CUH)],
-        cuda_wrappers=[("run", "muse_vr::sparse_final::SparseFinal::run")],
+        cuda_wrappers=[
+            ("run", "muse_vr::sparse_final::SparseFinal::run"),
+            ("coins", "muse_vr::sparse_final::SparseFinal::coins"),
+        ],
     )
+
+
+def _signed64(v: int) -> int:
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
+def _coins_selfcheck(dev) -> bool:
+    """MUSE_VR_SPARSE_FINAL_COINS, once (preload): at the generator's current state, the in-kernel draws equal two
+    ``torch.rand`` calls bit for bit at several sizes, and the reservation leaves the generator offset where those calls
+    leave it. The generator state is restored afterwards, so the check consumes nothing."""
+    index = _gen_index(dev)
+    gen = torch.cuda.default_generators[index]
+    state = gen.get_state()
+    ok = True
+    try:
+        for bs, gamma in ((1, 1), (3, 7), (4, 15), (32, 15), (64, 31)):
+            gen.set_state(state)
+            ref_a = torch.rand((bs, gamma), dtype=torch.float32, device=dev)
+            ref_b = torch.rand((bs,), dtype=torch.float32, device=dev)
+            off_ref = int(gen.get_offset())
+            gen.set_state(state)
+            seed, off_a, off_b = _reserve_coins(dev, bs * gamma, bs)
+            got_a = torch.empty((bs, gamma), dtype=torch.float32, device=dev)
+            got_b = torch.empty((bs,), dtype=torch.float32, device=dev)
+            sf_module().coins(got_a.view(-1), got_b, _signed64(seed), off_a, off_b)
+            ok = (
+                ok
+                and int(gen.get_offset()) == off_ref
+                and torch.equal(got_a.view(torch.int32), ref_a.view(torch.int32))
+                and torch.equal(got_b.view(torch.int32), ref_b.view(torch.int32))
+            )
+    finally:
+        gen.set_state(state)
+    return bool(ok)
 
 
 def _sf_ok(
@@ -1343,9 +1402,40 @@ def accept_from_topk(
     (retrieve_index, _rnt, _rns, predicts, accept_index, accept_token_num) = (
         _get_or_create_chain_verify_buffers(bs=bs, draft_token_num=block, device=device)
     )
-    uniform_samples, uniform_samples_final = (
-        coins if coins is not None else draw_coins(bs, block - 1, device)
-    )
+    bonus, coins_rng = None, None
+    if coins is None and bed.flag("sparse_final_coins"):
+        # MUSE_VR_SPARSE_FINAL_COINS: the fused kernel draws the two uniform tensors (same values as draw_coins)
+        uniform_samples = torch.empty(
+            (bs, block - 1), dtype=torch.float32, device=device
+        )
+        uniform_samples_final = torch.empty((bs,), dtype=torch.float32, device=device)
+        bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+        why = _coins_why(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            uniform_samples,
+            uniform_samples_final,
+            top_probs,
+            top_ids,
+            cand_ids,
+            q_rows,
+            vocab,
+            bonus,
+        )
+        if why is None:
+            coins_rng = _reserve_coins(device, bs * (block - 1), bs)
+            bed.count("sparse_final", "coins:fused")
+        else:
+            # host-side tally (once per capture under capture)
+            bed.count("sparse_final", "coins:stock:" + why)
+            uniform_samples, uniform_samples_final = draw_coins(bs, block - 1, device)
+    else:
+        uniform_samples, uniform_samples_final = (
+            coins if coins is not None else draw_coins(bs, block - 1, device)
+        )
     bonus = sparse_chain_sample(
         predicts=predicts,
         accept_index=accept_index,
@@ -1359,8 +1449,87 @@ def accept_from_topk(
         cand_ids=cand_ids,
         q_rows=q_rows,
         vocab=vocab,
+        bonus=bonus,
+        fused=True if coins_rng is not None else None,
+        coins_rng=coins_rng,
     )
     return accept_token_num, bonus, (uniform_samples, uniform_samples_final)
+
+
+@functools.lru_cache(maxsize=None)
+def _rand_grid_cap(index: int) -> int:
+    """The block-count cap of torch's distribution kernels on this device (DistributionTemplates.h
+    calc_execution_policy: multiprocessors x (max threads per multiprocessor / 256))."""
+    prop = torch.cuda.get_device_properties(index)
+    return int(prop.multi_processor_count) * (
+        int(prop.max_threads_per_multi_processor) // 256
+    )
+
+
+def _rand_increment(index: int, numel: int) -> int:
+    """The generator offset increment of one ``torch.rand`` of ``numel`` float32 elements (calc_execution_policy:
+    block 256, four values per curand_uniform4 call, four offsets per call)."""
+    grid = min((numel + 255) // 256, _rand_grid_cap(index))
+    return ((numel - 1) // (256 * grid * 4) + 1) * 4
+
+
+def _gen_index(device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _reserve_coins(device, n_a: int, n_b: int):
+    """Advance the default CUDA generator as ``torch.rand`` of ``n_a`` then of ``n_b`` elements would (one host step, in
+    the same place of the step's RNG order) and return (seed, offset of the first draw, offset of the second)."""
+    index = _gen_index(device)
+    gen = torch.cuda.default_generators[index]
+    seed, off = int(gen.initial_seed()), int(gen.get_offset())
+    inc_a, inc_b = _rand_increment(index, n_a), _rand_increment(index, n_b)
+    gen.set_offset(off + inc_a + inc_b)
+    return seed, off, off + inc_a
+
+
+def _coins_why(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    uniform_samples,
+    uniform_samples_final,
+    top_probs,
+    top_ids,
+    cand_ids,
+    q_rows,
+    vocab,
+    bonus,
+):
+    """None when the fused kernel can draw the coins for this call, else the reason ``torch.rand`` runs."""
+    if torch.cuda.is_current_stream_capturing():
+        return "capture"
+    if not bed.flag("sparse_final"):
+        return "fused off"
+    if not _state.get("coins_ok"):
+        return "self-check"  # not run yet (no preload) or failed: torch.rand
+    cap = 256 * _rand_grid_cap(_gen_index(candidates.device))
+    if uniform_samples.numel() > cap or uniform_samples_final.numel() > cap:
+        return "size"  # past one element per thread of torch's grid, its element-to-counter map changes
+    if not _sf_ok(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_final,
+        top_probs,
+        top_ids,
+        cand_ids,
+        q_rows,
+        vocab,
+        bonus,
+    ):
+        return "layout"
+    return None
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1480,6 +1649,8 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
         if fused:
             sf_module()
         info["check"] = _checked(dev, vocab) is None
+        if fused and bed.flag("sparse_final_coins"):
+            _state["coins_ok"] = info["coins_check"] = _coins_selfcheck(dev)
         side = torch.cuda.Stream(dev)
         side.wait_stream(torch.cuda.current_stream(dev))
         with torch.cuda.stream(side):
@@ -1782,7 +1953,13 @@ def _h_sample(original, worker, **kw):
 
     cand = kw["candidates"]
     bs, block = cand.shape
-    coins = draw_coins(bs, block - 1, cand.device)
+    # MUSE_VR_SPARSE_FINAL_COINS: accept_from_topk draws them at the same point of the step, in the fused kernel when
+    # it takes the call, else with draw_coins
+    coins = (
+        None
+        if bed.flag("sparse_final_coins")
+        else draw_coins(bs, block - 1, cand.device)
+    )
     accept_len, bonus, _ = accept_from_topk(
         candidates=cand,
         top_probs=a["probs"],
