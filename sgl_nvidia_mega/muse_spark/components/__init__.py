@@ -112,6 +112,7 @@ COMPONENTS = (
     "selector_fused",  # before selector_proj_overlap, so that one's build_lattice hook wraps this one's
     "selector_proj_overlap",
     "draft_head_lt",
+    "smx",  # after verify_attn and kv4_dec: its SWA-T mirror's install reads their decisions
     "rust_treecore",  # before any cache is built: arms the Rust TreeCore and records the core each cache gets
     "verify_topk_sample",  # last: its hooks wrap the other components' hooks
 )

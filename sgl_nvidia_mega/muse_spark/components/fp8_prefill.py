@@ -9,7 +9,12 @@ rule ``sp_gate`` uses, so a replayed bucket and the pass it serves take the same
 ``MUSE_VR_FP8_PREFILL_GROUPS`` (default ``qkv,o,pool,unpool``) run on MXFP8 operands: E4M3 values with one power-of-two
 scale per block of 32 elements along K, for the weight and the activation (``mxfp8_ops``: FlashInfer's quantizer and
 GEMM, as SGLang's MXFP8 linear method). Decode, target-verify and mixed passes, the draft model, the LM head, the
-embeddings and the experts are never touched; every projection keeps its BF16 weight for those.
+embeddings and the experts are never touched; every projection keeps its BF16 weight for those. Exception, opt-in
+(``MUSE_VR_FP8_PREFILL_MIXED=1``, which also lifts the refusal next to SGLang's DFLASH mixed verify,
+``SGLANG_OPT_DFLASH_MIXED_VERIFY``, and ``smx``): a mixed verify pass is one target EXTEND forward over the extend rows
+and the running batch's block (verify) rows, on the same prefill graph buckets, so a mixed pass above the threshold runs
+its block rows through the MXFP8 projections too (one threshold per bucket for both pass kinds; ``MIN_TOKENS`` must then
+be at least 1024). Counted ``pass:mixed:<bucket>`` and ``rows:block`` (from the pass's ``ForwardBatch.mixed_verify``).
 
 Per group:
 - ``qkv`` (sequence-parallel all-gather + GEMM): each rank quantizes its row shard before the all-gather, so the peers
@@ -110,6 +115,17 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": ("ForwardMode",),
     "srt/runtime_context.py": ("get_parallel",),
 }
+# SGLang's DFLASH mixed verify: the pass's layout on ForwardBatch.mixed_verify (mixed_verify_attention.py sets the
+# field on its views) and the layout's row counts. An SGLang without it has no layout: no pass is counted as mixed.
+SGLANG_OPTIONAL_READS = {
+    "srt/layers/attention/mixed_verify_attention.py": ("mixed_verify",),
+    "srt/speculative/dflash_mixed_verify.py": (
+        "num_extend_reqs",
+        "num_extend_tokens",
+        "num_verify_reqs",
+        "block_size",
+    ),
+}
 
 
 logger = logging.getLogger("muse_vr_plugin")
@@ -117,6 +133,7 @@ logger = logging.getLogger("muse_vr_plugin")
 NAME = "fp8_prefill"
 GROUPS_ALL = ("qkv", "o", "pool", "unpool")
 DEFAULT_MIN_TOKENS = 1280
+MIXED_MIN_TOKENS_FLOOR = 1024  # MUSE_VR_FP8_PREFILL_MIXED engages only passes of more than this many rows (or a higher MIN_TOKENS)
 SGLANG_PINS = {
     "sglang/srt/layers/layernorm_sp.py": (
         "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
@@ -255,6 +272,21 @@ _state: dict = {
 def pass_fp8(group: str) -> bool:
     """True inside a target-model forward that runs MXFP8 for ``group``."""
     return _state["pass"] and group in _state["groups"]
+
+
+def _smx_split(forward_batch):
+    """The mixed verify pass's split (SGLang's ``ForwardBatch.mixed_verify``), or None outside one: ``n_p`` extend
+    requests holding ``P`` extend rows (first), then ``bs`` running requests of ``block`` block rows each."""
+    # absent on an SGLang without DFLASH mixed verify
+    layout = getattr(forward_batch, "mixed_verify", None)
+    if layout is None:
+        return None
+    return {
+        "n_p": int(layout.num_extend_reqs),
+        "P": int(layout.num_extend_tokens),
+        "bs": int(layout.num_verify_reqs),
+        "block": int(layout.block_size),
+    }
 
 
 def _bucket(m: int) -> str:
@@ -949,6 +981,16 @@ def _wrap_forward(orig):
             )
         if on:
             bed.count(NAME, f"pass:{_bucket(n)}")
+            if _state.get("mixed"):
+                sp = _smx_split(forward_batch)
+                # a mixed verify pass: the block (verify) rows ride in this pass's MXFP8 projections
+                if sp is not None:
+                    bed.count(NAME, f"pass:mixed:{_bucket(n)}")
+                    bed.count(
+                        NAME,
+                        "rows:block",
+                        int(sp.get("block", 0)) * int(sp.get("bs", 0)),
+                    )
         try:
             return orig(
                 self, input_ids, positions, forward_batch, input_embeds, *args, **kwargs
@@ -1297,15 +1339,28 @@ def register() -> bool:
             reason="bad config: MUSE_VR_FP8_PREFILL_RESIDENT_LAYERS needs MUSE_VR_FP8_PREFILL_WEIGHTS=resident",
         )
         return False
-    if bed.enabled("smx"):
-        # smx's mixed passes replay the prefill graphs with the running batch's verify rows inside: those rows would take
-        # this component's MXFP8 projections, and decode / verify must stay BF16. Refused until a row-split form exists.
+    mixed = os.environ.get("MUSE_VR_FP8_PREFILL_MIXED", "").strip() == "1"
+    from . import smx
+
+    if (bed.enabled("smx") or smx.mixed_verify_reason() is None) and not mixed:
+        # mixed verify passes (SGLang's, with its switch on; smx's block-row forms) replay the prefill graphs with the
+        # running batch's verify rows inside: those rows would take this component's MXFP8 projections. Without
+        # MUSE_VR_FP8_PREFILL_MIXED=1 that is refused.
         bed.report(
             NAME,
             False,
             reason="refused next to smx (mixed passes carry verify rows through the prefill graphs)",
         )
         return False
+    if mixed and min_tokens < MIXED_MIN_TOKENS_FLOOR:
+        bed.report(
+            NAME,
+            False,
+            reason=f"MUSE_VR_FP8_PREFILL_MIXED needs MIN_TOKENS >= {MIXED_MIN_TOKENS_FLOOR} "
+            f"(got {min_tokens})",
+        )
+        return False
+    _state["mixed"] = mixed
     b3 = tuple(
         p.strip()
         for p in os.environ.get("MUSE_VR_FP8_PREFILL_B3", "").split(",")
