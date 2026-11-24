@@ -101,11 +101,25 @@ PINS = {
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # the model forward (wrapped as _forward): embedding, embedding norm, cast to the stream, layer 0's input norm
+        bed.Functions(
+            {
+                "MuseSpark1xModel.forward": ("5a17d5920ad718b9", "82b3cba268aa1fdc"),
+                "MuseSpark1xModel.__init__": ("494fbc30068c6846", "078c27dc5123bc97"),
+                "MuseSpark1xDecoderLayer.self_attn_input_norm": "a9a5fc977cd2bbee",
+                "_install_pre_attn_norm": "751281fc1db17919",
+            }
+        ),
     ),
     "sglang/srt/layers/muse_spark_layers.py": "930e66da715bae576ae681f2dfd8353a36a9ca469a229d88fa3f77bc1e74cef0",
     "sglang/srt/layers/layernorm_sp.py": (
         "ffdde97e6282103614d7cec20cc29fb3cf0157d051778e315b03a99bb8e81090",
         "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        bed.Functions(
+            {
+                "runs_sp": ("6049807aa2400a43", "edeeba97241e845a"),
+            }
+        ),
     ),
 }
 VALIDATED_TORCH = (
@@ -200,18 +214,63 @@ T_APPLY_INTO = (
 # given), the bf16 GEMM dispatch (8-row tactic) and the linear layers' call of it, the replicated embedding lookup
 # (embed_gather's pins) and the load order (the table is built before the KV cache is sized)
 TABLE_PINS = {
-    "sglang/srt/models/muse_spark_omni.py": "f186e56bbfa76ecb06d92330a5597513f5179efd7c1b9bc567955d4e800ef777",
+    "sglang/srt/models/muse_spark_omni.py": (
+        "f186e56bbfa76ecb06d92330a5597513f5179efd7c1b9bc567955d4e800ef777",
+        bed.Functions(
+            {
+                "MuseSparkForConditionalGeneration.forward": "db2869ebece39fc4",
+                "MuseSparkForConditionalGeneration.get_input_embeddings": "bf73220e168edb1f",
+                "MuseSparkForConditionalGeneration.__init__": "2132b23c4e27325c",
+                "_NormalizedEmbedding.forward": "df3c5697eaf243bc",
+                "_RMSNormWithoutScale.forward": "8e92eddcb59d82de",
+            }
+        ),
+    ),
     "sglang/srt/layers/quantization/unquant.py": (
         "f428022195466613e7e988265a1090862a5aa0557bb7a063c0c172f9bd3988c5",
         "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
+        bed.Functions(
+            {
+                "UnquantizedLinearMethod.apply": (
+                    "bb339fbe7a9643dd",
+                    "7ddcc07fb811fd7f",
+                ),
+                "UnquantizedLinearMethod.apply_into": (
+                    "cc8c933d469bfc79",
+                    "8094d0dc34e2b01c",
+                ),
+                "_bf16_gemm_dispatch_impl": ("7f678770cd557687", "a9d060061e2076e2"),
+            }
+        ),
     ),
-    "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+    "sglang/srt/layers/linear.py": (
+        "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+        bed.Functions(
+            {
+                "ColumnParallelLinear.forward": "7538aefbf1cabf51",
+            }
+        ),
+    ),
     "sglang/srt/layers/vocab_parallel_embedding.py": (
         "5c4a96a8ad291f7601876368cec75769adc152b6af6fffe317ae5fc44d10d4d1",
         "c36f5682e528fafe922b88ad0e9dd418b7f9558762058858707a6a75c25ea5cf",
+        bed.Functions(
+            {
+                "VocabParallelEmbedding._embed_local_shard": "1ba107d387e253cb",
+                "VocabParallelEmbedding.forward": "6a8dcd4d1ef6dae7",
+            }
+        ),
     ),
     "sglang/kernels/ops/embeddings/vocab_parallel_embedding.py": "7766e50514e621317fec277fd5975adc469d70ab2951722a99d56afbb6dc16d4",
-    "sglang/srt/model_executor/model_runner.py": "c3e8e4cab00b8d6a4303c8332ff5e2fea4618c57000aa2c9b4b78b42eeaab6a7",
+    "sglang/srt/model_executor/model_runner.py": (
+        "c3e8e4cab00b8d6a4303c8332ff5e2fea4618c57000aa2c9b4b78b42eeaab6a7",
+        bed.Functions(
+            {
+                "ModelRunner.load_model": ("010fa8672455369b", "516f93fe802dc592"),
+                "ModelRunner.initialize": ("23362e1fdf7d16d5", "5b28e6c78da93ca6"),
+            }
+        ),
+    ),
 }
 ROWS = 8  # the verify block of one request (K + 1 = 8): the only call the table takes
 CHECK_BATCHES = 512  # random 8-id batches of the install-time eager check (plus one batch of edge ids)

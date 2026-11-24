@@ -7,17 +7,20 @@ Both components gather with SGLang's pull kernel (``nvlink_comm.all_gather_pull`
 semaphore until every rank of the group has arrived, with no limit, and the gather is issued from the eager part of
 the step: if one rank never issues its half (for example it raised between two collectives), the other ranks poll
 forever instead of failing. With this option on, those two call sites launch ``csrc/pull_gather_bounded.cuh``
-instead: SGLang's kernel and launcher with the same grid, block, barrier windows, loads, stores and memory ordering,
+instead: SGLang's kernel and launcher with the same grid, block, barrier protocol, loads, stores and memory ordering,
 except that each barrier wait ends the kernel with a trap (a CUDA error on the host, after one diagnostic line from
 the device) after ``MUSE_VR_PULL_BOUNDED_MAX_POLLS`` unsuccessful polls (default ``DEFAULT_MAX_POLLS``; the wall time
 that takes is the poll count times the latency of one semaphore load, measured by ``tests/dist_pull_bounded.py
 --mode missing``). The gathered bytes are the same as the stock kernel's (``tests/dist_pull_bounded.py``).
 
 The plugin copy is used only while the SGLang sources it was derived from match their sha256 pins and the copy itself
-matches ``SOURCE_SHA256`` (the validated file); otherwise (and with the option off) the call goes to SGLang's own
-``all_gather_pull``. Both kernels keep the same barrier windows on the plane's semaphores, so calls of the two may be
-interleaved on one plane (the bitwise test does). ``prepare(dtype)`` builds the kernel module; the components call it
-before the collective that creates their gather plane, so no rank can wait on a peer that is still compiling.
+matches ``SOURCE_SHA256`` (the pinned file); otherwise (and with the option off) the call goes to SGLang's own
+``all_gather_pull``. Both kernels make the same arrivals and takes on the plane's semaphores (SGLang's stateless
+``McBarrier``), so calls of the two may be interleaved on one plane (the bitwise test does). The callers pass
+``NVLinkVocabGather.comm``, whose pull-plane semaphores other pull kernels on the group also use (with
+``make_vocab_gather``, those of the group's shared symmetric workspace): the copy must keep SGLang's barrier protocol
+exactly. ``prepare(dtype)`` builds the kernel module; the components call it before the collective that creates their
+gather plane, so no rank can wait on a peer that is still compiling.
 """
 
 from __future__ import annotations
@@ -56,27 +59,21 @@ _CUH = Path(__file__).resolve().parent / "csrc" / "pull_gather_bounded.cuh"
 
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) the plugin copy reproduces:
 # the pull kernel and its launcher, the barrier and semaphore operations, the PTX wrappers they use, and the Python
-# wrapper whose defaults (unroll, multicast pointer, block hint) the copy is launched with.
+# wrapper whose defaults (unroll, multicast pointer, block hint) the copy is launched with. SGLang 3117f58 + #48948
+# only: the copy takes arrivals as its stateless McBarrier does, unlike earlier revisions' windowed semaphores.
 PINS = {
-    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": (
-        "8fb785518279cf8944a6a438036cfe39a2c00ecc6b0b5b86a6a2a0b46ad01e37",
-        "e3c8f3c93a61c8788d4b97b9fbfa9cc0b5b1c9ee1b2154c9e7e04ab642431367",
-    ),
-    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
-    "sglang/kernels/jit/include/sgl_kernel/distributed/ptx.cuh": "1ef631431ff74974a5d05758c4af9335cf8937e42ed9f0dc591a8341598be822",
-    "sglang/kernels/ops/communication/nvlink_comm.py": (
-        "6ba171bd054fd70b1248be37214419887f6731eea9c927c6e0aa9ee0997bc3fd",
-        "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa",
-    ),
+    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": "492d9088bd43d633f1de16aefa1e0905b3ec30800324f1ee9fab3c61fd0d484a",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/ptx.cuh": "c0ab06b1538b9ccd80ca477c12ebaeed7c85401fab7fcaf8cef213102c679722",
+    "sglang/kernels/ops/communication/nvlink_comm.py": "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa",
 }
 
-# sha256 of csrc/pull_gather_bounded.cuh as validated (bitwise, fault and sanitizer tests); any other file is not used.
-# The validation ran on this file without its two copyright lines; the digest below is of this copy.
-SOURCE_SHA256 = "10423c5c0fbda9a28eb1223d24aa1f109bb778ced09bb920dc165ccc70104772"
+# sha256 of csrc/pull_gather_bounded.cuh (bitwise, fault and sanitizer tests: tests/dist_pull_bounded.py); any other
+# file is not used.
+SOURCE_SHA256 = "c222050e33798c2e3178e638601ea401fc36c6fc61b271c0836c44c004f5b8c0"
 # the row-layout copy (csrc/pull_gather_rows.cuh): same kernel with a row-layout store entry, used only through all_gather_pull_rows
 _ROWS_CUH = Path(__file__).resolve().parent / "csrc" / "pull_gather_rows.cuh"
-# The validation ran on this file without its copyright lines; the digest below is of this copy.
-ROWS_SOURCE_SHA256 = "351763dadedefc85754714d0da76811709b9c0d2472c0ec19ac19ed04c1c7a1c"
+ROWS_SOURCE_SHA256 = "ee8279b811b48c1cb58c2a4b59b47e996ff23c6d6f14c90cac5b5fda40cd01db"
 
 _state: dict = {"engaged": None, "max_polls": None}
 
@@ -107,7 +104,7 @@ def engage() -> bool:
         bed.report(
             NAME,
             False,
-            reason=f"{_CUH.name} sha256 {got[:16]} is not the validated {SOURCE_SHA256[:16]}",
+            reason=f"{_CUH.name} sha256 {got[:16]} is not the pinned {SOURCE_SHA256[:16]}",
         )
         _state["engaged"] = False
         return False

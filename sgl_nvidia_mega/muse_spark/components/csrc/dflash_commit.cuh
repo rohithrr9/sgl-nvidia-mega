@@ -4,7 +4,8 @@
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Source: SGLang python/sglang/kernels/jit/csrc/muse_spark_v12/all_gather.cuh (push-plane protocol) at revision
 // a55ab7d.
-// Modified by NVIDIA: one kernel for the DFLASH verify commit of a decode step:
+// Modified by NVIDIA: one kernel for the DFLASH verify commit of a decode step (the phase word follows the
+// EpochCounter protocol of sgl_kernel/distributed/communicator.cuh: one load, one commit per grid):
 //   1. (optional) rank 0's sampled accept lengths and bonus tokens are delivered to every rank (the decision
 //      broadcast), through the custom all-reduce push plane: rank 0 stores (accept_len + 1, bonus + 1) words into
 //      slot (dst = peer, src = 0) of every peer's push workspace for the current phase, and every other rank stores
@@ -42,7 +43,6 @@ __device__ __noinline__ void poll_bound_exceeded() {
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;
   uint32_t rank;
   bool exchange;
   int bs;
@@ -62,7 +62,7 @@ __global__ __launch_bounds__(kThreads) void commit_kernel(const __grid_constant_
   const int tid = threadIdx.x;
   uint32_t phase = 0;
   if (p.exchange) {
-    phase = p.ws.counter[0].get() & 1;
+    phase = p.ws.counter->load();
     const int nvec = (p.bs + 1) / 2;
     if (p.rank == 0) {
       for (int v = tid; v < nvec; v += kThreads) {
@@ -141,8 +141,8 @@ __global__ __launch_bounds__(kThreads) void commit_kernel(const __grid_constant_
   }
   device::PDLTriggerSecondary<kUsePDL>();
   if (p.exchange) {
-    __syncthreads();
-    for (uint32_t c = tid; c < p.num_counters; c += kThreads) p.ws.counter[c].set(phase ^ 1);
+    __syncthreads();  // every thread has read the phase before this block commits
+    if (tid == 0) p.ws.counter->commit();
   }
 }
 
@@ -190,7 +190,6 @@ struct MuseVrCommit {
     RuntimeCheck(push.world_size == kWorld, "the kernel is compiled for TP", kWorld);
     RuntimeCheck(int64_t((candidates.size(0) + 1) / 2) * 16 <= int64_t(push.slot_bytes), "batch above the push slot");
     p.ws = push.get_workspace<kWorld>(int64_t((candidates.size(0) + 1) / 2) * 16);
-    p.num_counters = push.num_blocks;
     p.rank = push.rank;
     p.exchange = true;
     launch(p, candidates, accept_len, bonus, out_tokens, commit_lens);

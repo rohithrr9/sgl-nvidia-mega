@@ -189,7 +189,7 @@ def run(
         split = split_from_env()
     rows = partial.shape[0]
     if split and (rows + (rows // BLOCK) * (split - 1)) * hidden * 2 > int(
-        comm.max_push_size
+        comm._max_push_size  # the push slot its 1shot_push may use
     ):
         split = (
             0  # the previous-row copies would not fit the push slot: the plain kernel

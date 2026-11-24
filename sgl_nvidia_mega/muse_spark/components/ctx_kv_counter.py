@@ -32,7 +32,7 @@ from . import bed
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "ctx_kv_counter"
-FLASHINFER_VERSIONS = ("0.7.2",)
+FLASHINFER_VERSIONS = ("0.7.2", "0.7.4")
 KW = "multi_ctas_kv_counter_buffer"
 
 _state: dict = {"engaged": None, "bufs": {}, "keep": [], "sig": None, "need": {}}

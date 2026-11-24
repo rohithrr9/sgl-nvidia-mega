@@ -66,22 +66,41 @@ logger = logging.getLogger("muse_vr_plugin")
 NAME = "sp_fp4_dispatch"
 
 SGLANG_PINS = {
-    # FlashinferDispatcher.dispatch (SP-prefill branch) and its output types
+    # FlashinferDispatcher.dispatch (SP-prefill branch) and its output types. sha256 only until _wrap_dispatch is
+    # ported: newer SGLang dispatches through flashinfer.moe_ep, whose dispatch() carries no per-token-scale payload
     "sglang/srt/layers/moe/token_dispatcher/flashinfer.py": "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
     # MuseSpark1xMoE._forward_sp_experts
     "sglang/srt/models/muse_spark.py": (
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        bed.Functions(
+            {
+                "MuseSpark1xMoE._forward_sp_experts": "376e220c2a2cfe32",
+                "MuseSpark1xMoE._forward_experts": (
+                    "04c56c86a0d682b6",
+                    "b80c7971fd8b3bfc",
+                ),
+            }
+        ),
     ),
     # fused_experts_none_to_flashinfer_trtllm_fp4: per-token quantization call, pre-quantized pass-through branch
     "sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "2f6f14ae1d95030db1ec249856b331f4e6880b0218727e8701c3944376acaaf9",
         "70db650773c0dcbeec8056d70ad6f6a0c06acd5d583e9bbbe8f4d5548cf25929",
+        bed.Functions(
+            {
+                "fused_experts_none_to_flashinfer_trtllm_fp4": (
+                    "0dfa54f6aadafdb9",
+                    "2a1f4fc4d88cc17f",
+                ),
+            }
+        ),
     ),
     "sglang/srt/layers/muse_spark_fp4_moe.py": (
         "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
         "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+        bed.Functions({"MuseSpark1xFp4Experts.forward_dispatched": "55ee763b2d00ed84"}),
     ),
 }
 FLASHINFER_PINS = {
@@ -120,6 +139,28 @@ PFRONT_PINS = {
 _ctx: contextvars.ContextVar = contextvars.ContextVar(
     "muse_vr_sp_fp4_dispatch", default=None
 )
+
+
+_MOE_EP_REASON = (
+    "not ported to the flashinfer.moe_ep all-to-all (FlashInfer 0.7.4+, no flashinfer.comm.MoeAlltoAll): its dispatch "
+    "takes a fixed payload set (hidden states, block scales, expert ids, weights; at most 4 payloads) with no slot for "
+    "the per-token scale this component sends as a fifth payload; stays stock"
+)
+
+
+def _moe_ep_refusal() -> str:
+    """The reason this component stays stock on a FlashInfer without ``flashinfer.comm.MoeAlltoAll`` (its all-to-all is
+    ``flashinfer.moe_ep``), else ``""``. Never raises."""
+    try:
+        spec = importlib.util.find_spec("flashinfer")
+        if spec is None or not spec.submodule_search_locations:
+            return ""  # no FlashInfer: _flashinfer_pins_ok reports it
+        root = Path(list(spec.submodule_search_locations)[0]).resolve().parent
+        if (root / "flashinfer/comm/trtllm_moe_alltoall.py").is_file():
+            return ""
+    except Exception:  # noqa: BLE001 - undecided here: the pin checks decide
+        return ""
+    return _MOE_EP_REASON
 
 
 def _flashinfer_pins_ok() -> tuple[bool, str]:
@@ -455,6 +496,11 @@ def engage() -> bool:
     if _state["engaged"] is not None:
         return _state["engaged"]
     if not bed.enabled(NAME):
+        _state["engaged"] = False
+        return False
+    why = _moe_ep_refusal()
+    if why:
+        bed.report(NAME, False, reason=why)
         _state["engaged"] = False
         return False
     for rel, sha in SGLANG_PINS.items():

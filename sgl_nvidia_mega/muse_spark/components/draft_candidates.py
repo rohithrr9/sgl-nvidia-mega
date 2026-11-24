@@ -4,8 +4,9 @@
 
 The DFlash2 draft proposes its block through a candidate selector that needs, for every drafted position, the global
 top-k (k = 16) tokens of the target head. SGLang computes them in ``candidate_topk`` (``models/dflash.py``): each
-tensor-parallel rank projects onto its vocabulary shard and takes the shard's top-k, then two NCCL all-gathers
-collect every rank's values and global ids, ``torch.topk`` picks the global top-k from the gathered ``tp * k``
+tensor-parallel rank projects onto its vocabulary shard and takes the shard's top-k, then two all-gathers over the
+head's group (or one multicast all-gather, ``_fused_candidate_all_gather``) collect every rank's values and global ids,
+``torch.topk`` picks the global top-k from the gathered ``tp * k``
 entries and ``torch.gather`` maps them to ids; ``DFlash2DraftModel._transform_unary_logits`` then applies the output
 multiplier and the soft cap in four elementwise launches. All of it runs inside the draft CUDA graph.
 
@@ -46,16 +47,18 @@ from . import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
-    "srt/distributed/communication_op.py": ("get_tp_group",),
     "srt/models/dflash.py": (
-        "_flashinfer_top_k",
+        "is_flashinfer_available",
         "get_parallel",
         "is_dense_head_weight",
         "should_apply_lm_head_quant_method",
-        "tensor_model_parallel_all_gather",
+        "_fused_candidate_all_gather",
         "_project_candidate_logits",
-        "_radix_topk",
+        "radix_topk",
+        "merge_candidates_fused",
     ),
+    "srt/layers/vocab_parallel_embedding.py": ("tp_group", "tp_size"),
+    "kernels/ops/communication/all_reduce.py": ("push", "slot_bytes"),
     "kernels/jit/utils/__init__.py": (
         "is_arch_support_pdl",
         "load_jit",
@@ -78,16 +81,25 @@ _CUH = Path(__file__).resolve().parent / "csrc" / "draft_candidates.cuh"
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) this component relies on: the
 # draft model (candidate_topk, its projection and shard top-k, the unary transform), the push plane and its
 # communicator header, and the gather kernel whose protocol the exchange follows.
+# The kernel follows the push plane's single phase counter (EpochCounter) of SGLang 3117f58 + #48948 and the stock tail
+# its head-group gathers; the sha256 entries of the revisions with per-block counters and TP-group gathers are gone.
 PINS = {
     "sglang/srt/models/dflash.py": (
-        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
-        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "candidate_topk": "5e55ac0c8feed838",
+                "DFlash2DraftModel.compute_candidates": "67d87a7938370c2c",
+                "DFlash2DraftModel._transform_unary_logits": "130d66b3e3514966",
+                "DFlash2DraftModel.__init__": "642cf97e68800931",
+                "_project_candidate_logits": "7bb97346a98d9369",
+                "_fused_candidate_all_gather": "906c103f030a95cd",
+            }
+        ),
     ),
     "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
-        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+        bed.Functions({"CustomAllReduceV2.obj": "4eba547724199cb9"}),
     ),
-    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
 }
 # PyTorch builds whose torch.topk tie order on the gathered entries the bitwise test matched (torch.version.git_version),
 # with the order each one uses (measured with tests/test_draft_candidates.py at every row count up to 8192):
@@ -294,7 +306,6 @@ def _preload(world: int, device) -> None:
 
 def _eligible(model, hidden: torch.Tensor):
     """(reason, context): reason is None when the fused path applies; context carries what it needs."""
-    import sglang.srt.distributed.communication_op as co
     import sglang.srt.models.dflash as d
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -304,7 +315,12 @@ def _eligible(model, hidden: torch.Tensor):
     selector = getattr(model, "candidate_selector", None)
     if lm_head is None or selector is None or int(selector.top_k) != TOP_K:
         return "head/selector", None
-    if d._flashinfer_top_k is None:
+    if getattr(model, "merge_candidates_fused", False):
+        return (
+            "fused candidate merge",
+            None,
+        )  # the stock path may merge in its own kernel (ROCm)
+    if not d.is_flashinfer_available():
         return "no shard top-k kernel", None
     if not (hidden.is_cuda and hidden.dim() == 2):
         return "hidden layout", None
@@ -315,10 +331,16 @@ def _eligible(model, hidden: torch.Tensor):
         return "quantized head", None
     if not d.is_dense_head_weight(weight):
         return "head weight", None
-    # the same lookups the stock path makes: tensor-parallel size as candidate_topk reads it, group as its gather does
-    tp = int(d.get_parallel().tp_size)
-    group = co.get_tp_group()
-    if tp not in (2, 4, 8) or group.world_size != tp:
+    # the same lookups the stock path makes: the head's shard count and group, as candidate_topk reads them (it refuses
+    # a head sharded over another group than the tensor-parallel one)
+    tp = int(lm_head.tp_size)
+    group = lm_head.tp_group
+    if (
+        tp not in (2, 4, 8)
+        or tp != int(d.get_parallel().tp_size)
+        or group is None
+        or group.world_size != tp
+    ):
         return "tensor-parallel size", None
     comm = getattr(group, "ca_comm", None)
     if (
@@ -330,7 +352,7 @@ def _eligible(model, hidden: torch.Tensor):
     n = hidden.shape[0]
     if n == 0:
         return "no rows", None
-    if n * TOP_K * 8 > int(comm.max_push_size):
+    if n * TOP_K * 8 > int(comm.obj.push.slot_bytes):
         return "rows above push slot", None
     key = (tp, _use_pdl(), hidden.device.index)
     if torch.cuda.is_current_stream_capturing():
@@ -348,8 +370,12 @@ def _stock_tail(model, lm_head, vals, ids):
     import sglang.srt.models.dflash as d
 
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = d.tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = d.tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered = d._fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
+    if gathered is not None:
+        gathered_vals, gathered_ids = gathered
+    else:
+        gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+        gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, TOP_K, dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), model._transform_unary_logits(
         top_vals
@@ -381,7 +407,7 @@ def compute_candidates(original, model, hidden: torch.Tensor):
         if shard_topk.supported(logits):
             vals, ids = shard_topk.topk16(logits)
     if vals is None:
-        vals, ids = d._radix_topk(logits, TOP_K)
+        vals, ids = d.radix_topk(logits, TOP_K)
     if (
         vals.dtype != torch.bfloat16
         or ids.dtype != torch.int64

@@ -9,6 +9,8 @@
 // the rows it owns (lamport push, fp32 accumulation in rank order, bf16 rounding, the same empty-marker remap of the
 // reduced vector as 2shot_push) and pushes the sums to every peer; every rank then runs the boundary arithmetic on every
 // row with the stock boundary kernel's per-row thread map. Slot polls are bounded (trap after kMaxPolls polls).
+// Ported to SGLang 3117f58's push plane (communicator.cuh): one EpochCounter phase word shared by every kernel on the
+// plane, read after the PDL wait and committed once per block, in place of the per-block phase counters.
 //
 // partial:    [M, H] bf16, this rank's partial sum of the sublayer output (row-parallel GEMM output); M % world == 0.
 // stream:     [M, H] fp32, the residual stream (identical on every rank).
@@ -37,7 +39,6 @@ namespace muse_vr_ar2_norm {
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;   // push plane counter array length
   uint32_t rank;
   uint32_t num_rows;
   uint32_t rows_per_rank;  // num_rows / kWorld
@@ -78,18 +79,11 @@ SGL_DEVICE void negative_control(const void* uninit) {
   }
 }
 
-// The phase of this round; block 0 also advances the counters of blocks this grid does not launch, so every counter
-// holds the same phase for the next push kernel on this plane.
+// The phase of this round: the plane's phase word, read after the PDL wait (EpochCounter::load).
 template <uint32_t kWorld>
 SGL_DEVICE uint32_t begin_phase(const Params<kWorld>& params) {
   negative_control(params.norm.router_out);  // no-op unless a test build defines MUSE_VR_AR2_NEGCTL
-  const uint32_t phase = params.ws.counter[blockIdx.x].get() & 1;
-  if (blockIdx.x == 0) {
-    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += blockDim.x) {
-      params.ws.counter[i].set(phase ^ 1);
-    }
-  }
-  return phase;
+  return params.ws.counter->load();
 }
 
 template <uint32_t kWorld>
@@ -97,10 +91,11 @@ SGL_DEVICE uint8_t* slot_ptr(const Params<kWorld>& params, uint32_t phase, uint3
   return params.ws.workspaces[dst] + (src + phase * kWorld) * params.ws.slot_bytes;
 }
 
+// Every thread of the block has read the phase: the block commits once (EpochCounter::commit, one participant per block).
 template <uint32_t kWorld>
 SGL_DEVICE void end_phase(const Params<kWorld>& params, uint32_t phase) {
   __syncthreads();
-  if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.ws.counter->commit();
 }
 
 // Upper bound on polls of one vector's slots. A peer that never delivers (a crashed or diverged rank) then ends the
@@ -409,7 +404,7 @@ __global__ void __launch_bounds__(kNumThreads)
   muse_vr_ar2_norm::end_phase(params, phase);
 }
 
-// C == 1: grid-stride over rows (the grid is capped at the push plane's counter count); per-row arithmetic is that
+// C == 1: grid-stride over rows (the grid is capped at the push plane's default launch width); per-row arithmetic is that
 // of muse_spark_norm_residual_kernel.
 template <
     int64_t kHidden,
@@ -705,14 +700,13 @@ struct MuseVrAr2NormResidual {
     RuntimeCheck(slot_need <= int64_t(push.slot_bytes), "rows exceed the push slot size");
     uint32_t grid = num_rows * kClusterSize;
     if constexpr (kClusterSize == 1) {
-      grid = std::min<uint32_t>(num_rows, push.num_blocks);
+      grid = std::min<uint32_t>(num_rows, push.default_blocks);
     } else {
-      RuntimeCheck(grid <= push.num_blocks, "M * cluster_size exceeds the push plane's block counters");
+      RuntimeCheck(grid <= push.default_blocks, "M * cluster_size exceeds the push plane's default launch width");
     }
 
     const auto params = muse_vr_ar2_norm::Params<kWorld>{
         .ws = push.get_workspace<kWorld>(slot_need),
-        .num_counters = push.num_blocks,
         .rank = push.rank,
         .num_rows = num_rows,
         .rows_per_rank = rows_per_rank,

@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Draft QK RMSNorm + table RoPE that also writes the query heads contiguously.
 
-SGLang's ``table_qk_norm_rope_`` (``sglang/srt/speculative/dflash_utils.py``) normalizes and rotates the query and key
-heads of the fused QKV tensor in place; the attention backend then copies the (strided) query view into a contiguous
-tensor. The kernel below performs the same per-(token, head) arithmetic, in the same order, and additionally stores the
-rotated query heads into a contiguous ``[tokens, q_heads, head_dim]`` tensor, so the copy becomes a no-op.
+SGLang's ``table_qk_norm_rope_`` (``sglang/kernels/ops/attention/table_qk_norm_rope.py`` on 3117f58 + #48948, formerly
+``sglang/srt/speculative/dflash_utils.py``) normalizes and rotates the query and key heads of the fused QKV tensor in
+place; the attention backend then copies the (strided) query view into a contiguous tensor. The kernel below performs
+the same per-(token, head) arithmetic, in the same order, and additionally stores the rotated query heads into a
+contiguous ``[tokens, q_heads, head_dim]`` tensor, so the copy becomes a no-op. The same arithmetic means an fp32
+rotary table: SGLang rotates a bf16 table in bf16, this kernel in fp32 (draft_boundary uses it with fp32 tables only).
 
 ``qk_norm_rope_qout_store`` additionally writes each token's rotated key heads and its value heads into the layer's KV cache
 rows at the token's write location (the rows the attention backend's ``set_kv_buffer`` would write for a plain bf16

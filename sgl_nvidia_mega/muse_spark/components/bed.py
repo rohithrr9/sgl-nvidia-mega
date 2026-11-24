@@ -8,7 +8,9 @@
 ``pinned(relpath, sha256_hex)``
     True when the installed SGLang source file (``relpath`` relative to the directory that holds the ``sglang``
     package, e.g. ``sglang/srt/models/muse_spark.py``) has exactly this sha256. The package is located without
-    importing it.
+    importing it. A pin tuple may also hold ``Functions({qualname: digest})``: a revision whose sha256 is not listed
+    then passes when each named function (the ones the component hooks, mirrors or calls there) has a listed token
+    digest, the same digest as ``SGLANG_MIRRORS`` in ``test/unit/test_contract.py``.
 ``report(name, engaged, **info)``
     Once per process and component: a WARNING-level log line ``muse_vr_plugin: <name> engaged=<bool> ...`` and, when
     ``MUSE_VR_ENGAGE_DIR`` is set, ``<dir>/install_<pid>.json`` holding every decision this process made. WARNING,
@@ -24,14 +26,17 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import os
 import threading
 import time
+import tokenize
 from pathlib import Path
 
 logger = logging.getLogger("muse_vr_plugin")
@@ -103,21 +108,118 @@ def sha_ok(got: str | None, want) -> bool:
 
 
 def sha_label(want) -> str:
-    return want[:16] if isinstance(want, str) else "|".join(w[:16] for w in want)
+    if isinstance(want, str):
+        return want[:16]
+    return "|".join(
+        f"functions:{len(w)}" if isinstance(w, Functions) else w[:16] for w in want
+    )
+
+
+class Functions(dict):
+    """A pin tuple entry, ``{qualname: digest}`` (``Class.method`` or ``function``; a digest or a tuple of digests): a
+    revision of the source whose sha256 the tuple does not list passes when every function named here has a listed
+    digest. Name the functions the component hooks, mirrors or calls in that source; an empty entry leaves the source
+    to the names its ``SGLANG_READS`` declares."""
+
+
+@functools.lru_cache(maxsize=None)
+def source_text(relpath: str) -> str | None:
+    """Text of the pinned source ``relpath`` at its installed location, read once per process."""
+    from . import sgl_compat
+
+    root = sglang_root()
+    if root is None:
+        return None
+    try:
+        return (root / sgl_compat.relpath(relpath)).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def function_digest(text: str, qualname: str) -> str | None:
+    """Token digest of ``qualname`` in the Python source ``text`` (None when it does not define it): decorators,
+    signature and body without comments, blank lines or docstring. ``test/unit/test_contract.py``'s
+    ``mirror_digest`` computes the same digest for ``SGLANG_MIRRORS``."""
+    try:
+        scope = ast.parse(text).body
+    except SyntaxError:
+        return None
+    *owners, name = qualname.split(".")
+    for owner in owners:
+        cls = next(
+            (n for n in scope if isinstance(n, ast.ClassDef) and n.name == owner), None
+        )
+        if cls is None:
+            return None
+        scope = cls.body
+    node = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+    lines = text.splitlines(keepends=True)[first - 1 : node.end_lineno]
+    doc = node.body[0]
+    has_doc = (
+        isinstance(doc, ast.Expr)
+        and isinstance(doc.value, ast.Constant)
+        and isinstance(doc.value.value, str)
+    )
+    skip = (doc.lineno - first + 1, doc.end_lineno - first + 1) if has_doc else None
+    digest = hashlib.sha256()
+    for tok in tokenize.generate_tokens(io.StringIO("".join(lines)).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.NL):
+            continue
+        if skip and skip[0] <= tok.start[0] and tok.end[0] <= skip[1]:
+            continue
+        # indentation depth is structure, not text
+        tok_text = "" if tok.type in (tokenize.INDENT, tokenize.NEWLINE) else tok.string
+        digest.update(f"{tok.type}:{tok_text}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+def functions_ok(relpath: str, fns: Functions) -> bool:
+    """True when every function ``fns`` names has one of its digests in the installed source ``relpath``."""
+    text = source_text(relpath)
+    if text is None:
+        return False
+    for qualname, want in fns.items():
+        got = function_digest(text, qualname)
+        if got is None or got not in ((want,) if isinstance(want, str) else want):
+            logger.warning(
+                "muse_vr_plugin: %s %s digest %s does not match the pin %s",
+                relpath,
+                qualname,
+                got or "<missing>",
+                want if isinstance(want, str) else "|".join(want),
+            )
+            return False
+    return True
 
 
 def pinned(relpath: str, sha256_hex) -> bool:
-    """``sha256_hex``: one digest, or a tuple of the digests of every validated revision of that source."""
+    """``sha256_hex``: one digest, or a tuple of the digests of every validated revision of that source (a tuple may
+    also hold ``Functions`` entries, checked when the installed sha256 is not listed)."""
     got = file_sha256(relpath)
-    if not sha_ok(got, sha256_hex):
-        logger.warning(
-            "muse_vr_plugin: %s sha256 %s does not match the pin %s",
-            relpath,
-            (got or "<missing>")[:16],
-            sha_label(sha256_hex),
-        )
-        return False
-    return True
+    if sha_ok(got, sha256_hex):
+        return True
+    if got is not None and not isinstance(sha256_hex, str):
+        if any(
+            isinstance(w, Functions) and functions_ok(relpath, w) for w in sha256_hex
+        ):
+            return True
+    logger.warning(
+        "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+        relpath,
+        (got or "<missing>")[:16],
+        sha_label(sha256_hex),
+    )
+    return False
 
 
 def _dump() -> None:

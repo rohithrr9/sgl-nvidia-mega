@@ -54,11 +54,34 @@ SGLANG_PINS = {
     "sglang/kernels/ops/gemm/cutedsl_bf16_gemm.py": (
         "c95c27b173142a1eaa94c25480f7e7efbd04bec3f900138f3335b4360a86c29d",
         "265a9444d0b980aaa46d1bd4113374dbf38ac86aa66235802fbe603f665bcec5",
+        bed.Functions(
+            {
+                "use_cutedsl_bf16_gemm": ("9730498a084a00a3", "b8b5245c032ade6e"),
+                "cutedsl_bf16_gemm": ("2f9b73c90c735899", "3952afec2b7c76c9"),
+                "_tgv_bf16_gemm_run": ("1eda27eed13bad76", "f3901e67cc9da534"),
+                "_pick_tactic": ("4c51e9f6fb6a18fb", "5737e1265e9c67c2"),
+                "TgvGemmCuteExtKernel.mma_warp": (
+                    "01400beb854f2b4c",
+                    "69eb6dbcb9663da9",
+                ),
+            }
+        ),
     ),
     # initialize_bf16_gemm_config binds the rule; _bf16_gemm_dispatch_impl consults the split-K table, then the rule
     "sglang/srt/layers/quantization/unquant.py": (
         "f428022195466613e7e988265a1090862a5aa0557bb7a063c0c172f9bd3988c5",
         "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
+        bed.Functions(
+            {
+                "initialize_bf16_gemm_config": ("293a36153ec50715", "0d5b13cba5a8606d"),
+                "_bf16_gemm_dispatch_impl": ("7f678770cd557687", "a9d060061e2076e2"),
+                "use_bf16_splitk_gemm": ("2503e44bf976740d", "89bc4f13cc671357"),
+                "UnquantizedLinearMethod.apply_into": (
+                    "cc8c933d469bfc79",
+                    "8094d0dc34e2b01c",
+                ),
+            }
+        ),
     ),
 }
 

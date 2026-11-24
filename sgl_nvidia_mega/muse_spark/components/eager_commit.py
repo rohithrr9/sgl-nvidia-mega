@@ -15,7 +15,10 @@ committed block. Outputs are identical to the stock sequence (integer copies onl
 GPU, tests/dist_eager_commit.py across ranks); no work the stock path does is skipped. The component does not change
 the synthetic-acceptance benchmark handling: on the branch layout SGLang applies that mode's forcing after
 ``_accept_block`` and it runs unchanged; on SGLang main the forcing is the last statement of ``_accept_block``, and the
-component runs that same statement with the same arguments.
+component runs that same statement with the same arguments. On the supported SGLang the selector path also passes
+``cutoff_verify_lens`` to the sampling call and broadcasts its ``cap_trim_lens`` before the commit; the component makes
+the same call and the same broadcast. That SGLang ships the same fused commit (``SGLANG_OPT_DFLASH_EAGER_COMMIT``,
+``_commit_selector_accept``); while this component is engaged it handles the selector path, so the two never both run.
 
 Engaged only for the selector sampling path with accept lengths int32 and bonus tokens int64, contiguous candidates,
 at most 1024 requests and, when the decision broadcast is enabled for the group, a custom all-reduce push plane on a
@@ -44,7 +47,13 @@ SGLANG_READS = {
     ),
     "srt/speculative/spec_tp_sync.py": ("SpecTpSyncSite",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
-    "srt/speculative/dflash_worker_v2.py": ("_commit_accept",),
+    "srt/speculative/dflash_worker_v2.py": (
+        "_commit_accept",
+        "SIMULATE_ACC_LEN",
+        "SIMULATE_ACC_METHOD",
+        "SIMULATE_ACC_TOKEN_MODE",
+        "apply_dflash_simulated_acceptance",
+    ),
 }
 
 
@@ -54,24 +63,41 @@ NAME = "eager_commit"  # env MUSE_VR_EAGER_COMMIT
 TARGET_ACCEPT = "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._accept_block"
 _CUH = Path(__file__).resolve().parent / "csrc" / "dflash_commit.cuh"
 
+# csrc/dflash_commit.cuh uses the push plane's EpochCounter phase word (load / commit), which the earlier SGLang
+# revisions do not have, so only revisions with that communicator are pinned.
 PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
-        "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
-        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        bed.Functions(
+            {
+                "DFlashWorkerV2._accept_block": "a04a15a5ec8319b8",
+                "DFlashWorkerV2._selector_sampling_accept": "ebd8291583a59153",
+                "DFlashWorkerV2._commit_selector_accept": "92246006c11bea50",
+                "_commit_accept": "6f5e074cf9f76d85",
+            }
+        ),
     ),
     "sglang/srt/speculative/spec_utils.py": (
-        "3ad5d2e1b00d7f79fc535379844011aebfe03f09b515274afc5fab36cf01a596",
-        "bfa9d4cd9565b808684f6a51cf5cf27804fc2914c0053beb04ad2ed01eadac64",
+        # Nothing here is called or mirrored: the SIMULATE_ACC_* settings are read through the worker module.
+        bed.Functions({}),
     ),
     "sglang/srt/speculative/spec_tp_sync.py": (
-        "da69ea9437ecbae9378c4fbf5d965da3c74c9d3b2d9663f991008c2f1968bf7a",
-        "224fdb1aa782044fc7d253b72962c19ed105db39b772b19a3b2b71ebf799ce3f",
+        bed.Functions(
+            {
+                "SpecTpSync.__init__": "5a9d15bcab0fc2d9",
+                "SpecTpSync.enabled": "b1ac98be791b8b86",
+                "SpecTpSync.sync": "286a72c967b47320",
+            }
+        ),
     ),
     "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
-        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+        bed.Functions(
+            {
+                "CustomAllReduceV2.__init__": "6871008b7ea3d24e",
+                "CustomAllReduceV2.obj": "4eba547724199cb9",
+            }
+        ),
     ),
-    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
 }
 
 
@@ -158,11 +184,13 @@ def _consensus() -> bool:
     return verify_chain.consensus_taken()
 
 
-def _result(kw, accept_len, commit_lens, bonus, out_tokens):
+def _result(worker, kw, accept_len, commit_lens, bonus, out_tokens, cap_trim_lens):
     """``_accept_block``'s return value for the installed SGLang. The branch layout returns six values and its caller
-    applies the synthetic-acceptance forcing afterwards. SGLang main returns five and applies that forcing at the end
-    of ``_accept_block`` itself; on main this runs the same statement with the same arguments (the selector path leaves
-    ``target_predict`` as passed in), so what runs after the decision is unchanged in both layouts."""
+    applies the synthetic-acceptance forcing afterwards. SGLang main applies that forcing at the end of
+    ``_accept_block`` itself and returns six values, the last two ``new_seq_lens`` (the forcing's, else None on the
+    selector path) and ``cap_trim_lens`` (None once forced); on main this runs the same statement with the same
+    arguments (the selector path leaves ``target_predict`` as passed in), so what runs after the decision is unchanged
+    in both layouts."""
     from . import sgl_compat
 
     if sgl_compat.layout() != "main":
@@ -176,8 +204,9 @@ def _result(kw, accept_len, commit_lens, bonus, out_tokens):
         )
     import sglang.srt.speculative.dflash_worker_v2 as w
 
+    new_seq_lens = None
     if w.SIMULATE_ACC_LEN > 0:
-        w.apply_dflash_simulated_acceptance(
+        new_seq_lens = w.apply_dflash_simulated_acceptance(
             candidates=kw["candidates"],
             target_predict=kw.get("target_predict"),
             accept_len=accept_len,
@@ -188,13 +217,18 @@ def _result(kw, accept_len, commit_lens, bonus, out_tokens):
             simulate_acc_method=w.SIMULATE_ACC_METHOD,
             simulate_acc_token_mode=w.SIMULATE_ACC_TOKEN_MODE,
             next_token_logits=kw["next_token_logits"],
+            generator=worker._simulated_acc_len_rng,
+            prefix_lens=kw["prefix_lens"],
+            new_seq_lens=new_seq_lens,
         )
-    return accept_len, commit_lens, bonus, out_tokens, None
+        cap_trim_lens = None
+    return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
 
 def accept_block(original, worker, **kw):
     """``DFlashWorkerV2._accept_block`` (pinned revisions), selector path, with broadcast + commit fused."""
-    if worker._selector_sample is None:
+    # The stock selector path needs no resolved argmax (a vocab-sharded verify's argmax makes the accept greedy).
+    if worker._selector_sample is None or kw.get("target_predict") is not None:
         return original(worker, **kw)
     cand = kw["candidates"]
     if (
@@ -209,15 +243,20 @@ def accept_block(original, worker, **kw):
     if need and comm is None:
         bed.count(NAME, "stock:" + why)
         return original(worker, **kw)
+    from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+
     sel_ids, sel_q = worker._selector_sample
-    accept_len, bonus = worker._selector_sampling_accept(
+    accept_len, bonus, cap_trim_lens = worker._selector_sampling_accept(
         candidates=cand,
         next_token_logits=kw["next_token_logits"],
         candidate_ids=sel_ids,
         q_rows=sel_q,
         sampling_info=kw["sampling_info"],
         draft_input=kw["draft_input"],
+        cutoff_verify_lens=kw.get("cutoff_verify_lens"),
     )
+    # stock broadcasts the cut counts on their own, before the commit
+    worker._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
     if (
         accept_len.dtype != torch.int32
         or bonus.dtype != torch.int64
@@ -226,12 +265,13 @@ def accept_block(original, worker, **kw):
         # the sampled values are ready; finish exactly as stock does from here
         bed.count(NAME, "stock:sampled dtypes")
         from sglang.srt.speculative.dflash_worker_v2 import _commit_accept
-        from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
         worker._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
         worker._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
         out_tokens, commit_lens = _commit_accept(cand, accept_len, bonus)
-        return _result(kw, accept_len, commit_lens, bonus, out_tokens)
+        return _result(
+            worker, kw, accept_len, commit_lens, bonus, out_tokens, cap_trim_lens
+        )
     if comm is not None and _consensus():
         # verify_chain made every rank compute rank 0's decision (rank 0's draws on identical top-k lists): the
         # broadcast would deliver the values every rank already holds, so the commit runs locally
@@ -239,7 +279,9 @@ def accept_block(original, worker, **kw):
         bed.count(NAME, "consensus")
     out_tokens, commit_lens = commit(cand, accept_len, bonus, comm)
     bed.count(NAME, f"fused:bs={cand.shape[0]}:exchange={int(comm is not None)}")
-    return _result(kw, accept_len, commit_lens, bonus, out_tokens)
+    return _result(
+        worker, kw, accept_len, commit_lens, bonus, out_tokens, cap_trim_lens
+    )
 
 
 def register() -> bool:

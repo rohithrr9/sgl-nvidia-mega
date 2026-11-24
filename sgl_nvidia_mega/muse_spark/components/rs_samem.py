@@ -51,15 +51,51 @@ logger = logging.getLogger("muse_vr_plugin")
 NAME = "rs_samem"
 SGLANG_PINS = {
     # matmul_reduce_scatter: one workspace(...) lookup, then ws.handle.barrier(channel=0), then the launch
-    "sglang/kernels/ops/communication/sp_collective_gemm.py": "f1cc99967104416a31fe7c99a710a9ccf8024ac1579c08579f11ac68a476a836",
+    "sglang/kernels/ops/communication/sp_collective_gemm.py": (
+        "f1cc99967104416a31fe7c99a710a9ccf8024ac1579c08579f11ac68a476a836",
+        bed.Functions(
+            {
+                "matmul_reduce_scatter": "eee82831fa289a66",
+            }
+        ),
+    ),
     # row_parallel_gbar_matmul imports matmul_reduce_scatter from the module at call time
-    "sglang/srt/layers/layernorm_sp.py": "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
-    "sglang/srt/layers/communication/sp_collective_gemm_workspace.py": "099026321d22ee2956e7d1314bd4e9a26c14279aadf54cabc3c81f0748225a3c",
+    "sglang/srt/layers/layernorm_sp.py": (
+        "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        bed.Functions(
+            {
+                "row_parallel_gbar_matmul": ("eb12fef27a69d7a4", "8bfbed80df1b9e08"),
+            }
+        ),
+    ),
+    "sglang/srt/layers/communication/sp_collective_gemm_workspace.py": (
+        "099026321d22ee2956e7d1314bd4e9a26c14279aadf54cabc3c81f0748225a3c",
+        bed.Functions(
+            {
+                "sp_collective_gemm_workspace": (
+                    "287b9c10c51b1fbc",
+                    "a3cbd8b19064ff14",
+                ),
+                "SPCollectiveGemmWorkspace.__init__": "7df4011f81edf7d5",
+            }
+        ),
+    ),
     # MuseSpark1xModel.forward: one call per model forward; every decoder layer is a sparse (MoE) layer whose only
     # reduce-scatter call is its o_proj, after its own qkv all-gather
     "sglang/srt/models/muse_spark.py": (
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        bed.Functions(
+            {
+                "MuseSpark1xModel.forward": ("5a17d5920ad718b9", "82b3cba268aa1fdc"),
+                "MuseSpark1xModel.__init__": ("494fbc30068c6846", "078c27dc5123bc97"),
+                "MuseSpark1xDecoderLayer.forward": (
+                    "51e40503e316c464",
+                    "16062a0b89c4ee50",
+                ),
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+            }
+        ),
     ),
 }
 

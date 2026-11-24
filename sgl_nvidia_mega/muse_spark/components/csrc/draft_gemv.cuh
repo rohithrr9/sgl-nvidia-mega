@@ -123,10 +123,10 @@ struct alignas(64) Params {
   bf16_t* __restrict__ conv_out;     // [m, hidden]
   bf16_t* __restrict__ coef_out;     // [m, 4 * groups]
   int groups;                        // channel groups (hidden / 16)
-  // kEpiPush: the consumer is the draft layer boundary (draft_ar_norm, one-shot push protocol): its block b = request block x
-  // push_cluster + column slice reads phase counter[b] & 1 and polls slot (src = rank + phase x world) of its own workspace
+  // kEpiPush: the consumer is the draft layer boundary (draft_ar_norm, one-shot push protocol): its block for request block x
+  // push_cluster + column slice reads the plane's phase and polls slot (src = rank + phase x world) of its own workspace
   uint8_t* push_ws[8];               // every rank's push workspace base
-  const uint32_t* push_counter;      // the plane's block counters (this rank)
+  const uint32_t* push_counter;      // the plane's EpochCounter phase word as two 32-bit halves (this rank)
   uint32_t push_slot_bytes;
   int push_world;
   int push_rank;
@@ -504,7 +504,6 @@ SGL_DEVICE void epilogue(const Params& p, float (&acc)[C::kMTilesPerWarp][C::kNT
       // (+0.0, -0.0), as the push protocol requires; the consumer applies the same rewrite to its own vector)
       constexpr int kVecs = C::kBoxRows / 8;
       const int row_vecs = p.n / 8;
-      const int slice = p.n / p.push_cluster;
       for (int e = tid; e < p.m * kVecs; e += C::kConsumerThreads) {
         const int tok = e / kVecs, v = e % kVecs;
         const int n0 = tile * C::kBoxRows + v * 8;
@@ -520,8 +519,9 @@ SGL_DEVICE void epilogue(const Params& p, float (&acc)[C::kMTilesPerWarp][C::kNT
         if (val.y == 0u) val.y = 0x8000u;
         if (val.z == 0u) val.z = 0x8000u;
         if (val.w == 0u) val.w = 0x8000u;
-        const int b = (tok / 8) * p.push_cluster + n0 / slice;
-        const uint32_t phase = p.push_counter[b] & 1u;
+        // the phase the boundary reads: bit 0 of the phase word's high half (EpochCounter::load), after this grid's PDL
+        // wait; the boundary (kConsumerOnly) commits it
+        const uint32_t phase = p.push_counter[1] & 1u;
         const int64_t vid = static_cast<int64_t>(tok) * row_vecs + n0 / 8;
         const uint32_t src = static_cast<uint32_t>(p.push_rank) + phase * p.push_world;
         if (p.push_mc != nullptr) {

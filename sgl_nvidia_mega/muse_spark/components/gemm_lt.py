@@ -16,7 +16,8 @@ sweep). Each one gives the same output bits as ``F.linear`` at every row count o
 checks this on several input sets); an entry whose summation order differed from the library's own pick would fail it.
 
 Every call it cannot take runs the stock path, counted with its reason: no entry for the shape and row count, the
-split-K table or the TGV rule taking the call (the dispatch would not reach cuBLAS), a bias or addend, dtype / layout,
+split-K table or the TGV rule taking the call (the dispatch would not reach cuBLAS; on SGLang 3117f58 + #48948 also its
+low-M autotune step and its tiny gemv), a bias or addend, dtype / layout,
 SGLang's batch-invariant mode, a configuration the library rejects for that row count or that needs a workspace
 (``cublasLtMatmulAlgoCheck``; no workspace is ever passed), a (shape, row count) whose first-use check failed or that is
 first met inside a CUDA graph capture, setup first needed inside a capture, or a library error. The first eager call of
@@ -66,9 +67,41 @@ LIB = "libcublasLt.so.13"
 LIB_VERSION = 130801  # cublasLtGetVersion() the default entries were chosen with; MUSE_VR_GEMM_LT_LIB_VERSION overrides
 PINS = {
     # _bf16_gemm_dispatch_impl (wrapped), the split-K table check and the TGV rule binding it consults
-    "sglang/srt/layers/quantization/unquant.py": "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
+    "sglang/srt/layers/quantization/unquant.py": (
+        "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
+        bed.Functions(
+            {
+                "_bf16_gemm_dispatch_impl": ("7f678770cd557687", "a9d060061e2076e2"),
+                "_bf16_low_m_autotune": "a9ac9d38b2056c34",
+                "_use_bf16_tiny_gemv": "5e0669f2c63b8a9a",
+                "use_bf16_splitk_gemm": ("2503e44bf976740d", "89bc4f13cc671357"),
+                "bf16_gemm_dispatch": "a774516d6d09eec9",
+                "UnquantizedLinearMethod.apply": (
+                    "bb339fbe7a9643dd",
+                    "7ddcc07fb811fd7f",
+                ),
+                "UnquantizedLinearMethod.apply_with_addend": "c718146563af3811",
+                "initialize_bf16_gemm_config": ("293a36153ec50715", "0d5b13cba5a8606d"),
+            }
+        ),
+    ),
     # LogitsProcessor._compute_lm_head (hooked): the branch order that leads to its plain torch.matmul
-    "sglang/srt/layers/logits_processor.py": "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+    "sglang/srt/layers/logits_processor.py": (
+        "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+        bed.Functions(
+            {
+                "LogitsProcessor._compute_lm_head": (
+                    "d6485ed1c8a88abe",
+                    "89cc2b17464ec741",
+                ),
+                "_aiter_lm_head_ok": "8402bfb91fb04a79",
+                "should_apply_lm_head_quant_method": (
+                    "5699b58992f22e41",
+                    "30771c72ed3465ab",
+                ),
+            }
+        ),
+    ),
 }
 LM_TARGET = "sglang.srt.layers.logits_processor.LogitsProcessor._compute_lm_head"
 DEFAULT_LM_HEAD_RULES = ";".join(
@@ -329,8 +362,9 @@ def _plan(st: dict, m: int, n: int, k: int, cfg: tuple):
     return ent
 
 
-def lt_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple):
-    """``F.linear(x, weight)`` for a 2-D bf16 ``x`` through configuration ``cfg``: (result, None) or (None, reason)."""
+def lt_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple, out=None):
+    """``F.linear(x, weight)`` for a 2-D bf16 ``x`` through configuration ``cfg``: (result, None) or (None, reason).
+    ``out``: a contiguous bf16 ``[m, n]`` tensor on ``x``'s device to write the result into (None: a new tensor)."""
     try:
         st = _device_state(x.device)
     except RuntimeError as e:
@@ -341,7 +375,8 @@ def lt_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple):
     if ok != "ok":
         return None, f"configuration {ok} for this row count"
     stream = torch.cuda.current_stream(x.device)
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     rc = _lib().cublasLtMatmul(
         st["handle"],
         st["desc"],
@@ -373,7 +408,7 @@ def _batch_invariant() -> bool:
     return bool(is_batch_invariant_mode_enabled())
 
 
-def checked_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple, stock):
+def checked_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple, stock, out=None):
     """``lt_linear`` behind the first-use check: (result, None) or (None, reason). ``stock()`` computes the stock output."""
     idx = x.device.index if x.device.index is not None else torch.cuda.current_device()
     key = (idx, weight.shape[0], weight.shape[1], x.shape[0], cfg)
@@ -382,7 +417,7 @@ def checked_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple, stock):
         return None, "first-use check failed"
     if state is None and torch.cuda.is_current_stream_capturing():
         return None, "not yet checked when first met inside a graph capture"
-    out, why = lt_linear(x, weight, cfg)
+    out, why = lt_linear(x, weight, cfg, out)
     if out is None or state is True:
         return out, why
     ref = stock()
@@ -400,6 +435,37 @@ def checked_linear(x: torch.Tensor, weight: torch.Tensor, cfg: tuple, stock):
     return out, None
 
 
+def _low_m_autotune_runs(
+    U, x: torch.Tensor, weight: torch.Tensor, bias, m: int
+) -> bool:
+    """Whether the dispatch's first step ``_bf16_low_m_autotune`` (3117f58 + #48948; absent before) launches for this call:
+    it takes bias-free calls of at most ``_BF16_LOW_M_AUTOTUNE_MAX_M`` rows under compile / graph capture, and profiles
+    every eligible call while FlashInfer's autotuner is tuning (that call then goes on through the routes below)."""
+    if getattr(U, "_mm_bf16", None) is None:
+        return False
+    taken = (
+        bias is None
+        and 0 < m <= U._BF16_LOW_M_AUTOTUNE_MAX_M
+        and (
+            torch.compiler.is_compiling()
+            or U.get_is_capture_mode()
+            or U.is_in_prefill_graph_scope()
+            or (x.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+    )
+    if not (taken or (m > 0 and U._flashinfer_autotuner.is_tuning_mode)):
+        return False
+    return (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and weight.shape[1] % U._CUTE_DSL_BF16_CTA_K == 0
+        and not weight.requires_grad
+    )
+
+
 def take(U, x: torch.Tensor, weight: torch.Tensor, bias=None, addend=None):
     """The component's output for a dispatch call (None: the stock dispatch runs it). ``U`` is SGLang's module."""
     if x.dim() < 1 or weight.dim() != 2:
@@ -415,10 +481,16 @@ def take(U, x: torch.Tensor, weight: torch.Tensor, bias=None, addend=None):
         why = "dtype"
     elif _batch_invariant():
         why = "batch-invariant mode"
+    elif _low_m_autotune_runs(U, x, weight, bias, m):
+        why = "low-M autotune step runs"
     elif getattr(U, "_enable_bf16_splitk_gemm", False) and U.use_bf16_splitk_gemm(
         m, n, k
     ):
         why = "split-K table takes it"
+    elif getattr(U, "_use_bf16_tiny_gemv", None) is not None and U._use_bf16_tiny_gemv(
+        x, weight, bias
+    ):
+        why = "tiny gemv takes it"
     elif getattr(
         U, "_use_hopper_bf16_gemv", None
     ) is not None and U._use_hopper_bf16_gemv(m, n, k):
@@ -450,7 +522,7 @@ def take(U, x: torch.Tensor, weight: torch.Tensor, bias=None, addend=None):
     return None
 
 
-def _plain_lm_head_path(proc, lm_head, embedding_bias) -> bool:
+def _plain_lm_head_path(proc, lm_head, embedding_bias, hidden_states=None) -> bool:
     """Whether the stock ``_compute_lm_head`` would run its plain ``torch.matmul`` for this call."""
     import sglang.srt.layers.logits_processor as LP
 
@@ -462,9 +534,19 @@ def _plain_lm_head_path(proc, lm_head, embedding_bias) -> bool:
         return False
     if not hasattr(lm_head, "weight") or getattr(proc, "use_fp32_lm_head", False):
         return False
+    if getattr(proc, "use_fp32_lm_head_output", False):
+        return False  # 3117f58 + #48948: fp32-output torch.mm for the bf16 / fp16 CUDA inputs this component takes
     if (
         getattr(lm_head, "use_intel_amx_backend", False)
         or getattr(proc, "rl_on_policy_target", None) is not None
+    ):
+        return False
+    # the ROCm gfx1250 tgemm branch of SGLang 3117f58 + #48948
+    aiter_ok = getattr(LP, "_aiter_lm_head_ok", None)
+    if (
+        aiter_ok is not None
+        and hidden_states is not None
+        and aiter_ok(hidden_states, lm_head.weight)
     ):
         return False
     return embedding_bias is None
@@ -475,10 +557,10 @@ def _around_lm_head(
 ):
     if (
         not args
-        and not kwargs
+        and set(kwargs) <= {"out"}
         and _state["lm_rules"]
         and hidden_states.dim() == 2
-        and _plain_lm_head_path(proc, lm_head, embedding_bias)
+        and _plain_lm_head_path(proc, lm_head, embedding_bias, hidden_states)
     ):
         w = lm_head.weight
         m, k = hidden_states.shape
@@ -489,6 +571,12 @@ def _around_lm_head(
         )
         if cfg is not None:
             why = None
+            # 3117f58 + #48948: the plain path writes into ``out`` when it has the result's shape and the weight's dtype
+            dst = kwargs.get("out")
+            if dst is not None and (
+                dst.shape != (m, w.shape[0]) or dst.dtype != w.dtype
+            ):
+                dst = None
             if hidden_states.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
                 why = "dtype"
             elif _batch_invariant():
@@ -498,11 +586,18 @@ def _around_lm_head(
                 and hidden_states.is_contiguous()
                 and w.is_contiguous()
                 and w.shape[1] == k
+            ) or (
+                dst is not None
+                and not (dst.is_contiguous() and dst.device == hidden_states.device)
             ):
                 why = "layout"
             if why is None:
                 out, why = checked_linear(
-                    hidden_states, w, cfg, lambda: torch.matmul(hidden_states, w.T)
+                    hidden_states,
+                    w,
+                    cfg,
+                    lambda: torch.matmul(hidden_states, w.T),
+                    dst,
                 )
                 if out is not None:
                     bed.count(NAME, f"lt_lm_head:{w.shape[0]}x{k}:m{m}")

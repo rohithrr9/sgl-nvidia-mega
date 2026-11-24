@@ -67,14 +67,34 @@ TORCH_GIT = "7bf52b3a9782d3440a17eb3f00983795f3b12af0"
 MODULE_SHA256 = "4537c75d00d1a46b2b6fd8b4afb1aa5c0dcae6e2cd56ac22b519e18b857e0390"
 # SGLang sources whose behaviour this mechanism relies on (range check, registry fallback, loader shortcut, hook target).
 PINS = {
-    "sglang/srt/rust_extensions/torch_build.py": "36fce352fe9b3aa1b699f50f0a2ed09fa0d8a612d061384e7e177faf92b4126e",
+    "sglang/srt/rust_extensions/torch_build.py": (
+        "36fce352fe9b3aa1b699f50f0a2ed09fa0d8a612d061384e7e177faf92b4126e",
+        # The range check reads _MIN/_MAX_SUPPORTED_TORCH at call time (the newer range ends at 2.15).
+        bed.Functions({"torch_build_configuration": "1179bb4887b6d610"}),
+    ),
     "sglang/srt/mem_cache/unified_cache/tree_core_registry.py": (
-        "ab08c6584ab8d0b354a1ec616c81dd5745933a5c585a4c4b9a6c8b8f1c124118"
+        "ab08c6584ab8d0b354a1ec616c81dd5745933a5c585a4c4b9a6c8b8f1c124118",
+        # The newer fallback adds tree-slot checks before the same range check and sys.modules shortcut.
+        bed.Functions(
+            {
+                "_rust_fallback_reason": ("02d9f7db1212968f", "fa5160eb7767f62f"),
+                "resolve_tree_core_backend": "5f69bd9dca4c79c0",
+                "select_tree_core_backend": "34c3874fcd111078",
+                "_rust_tree_core_factory": "3d637266c5c2c650",
+                "create_tree_core": "fc838fad4016c267",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/rust_tree_core/extension.py": "bf6ed9f4eac2d01990388e79dd230769ee388211dbd9e09b5834c6fde981e550",
     "sglang/srt/mem_cache/rust_tree_core/__init__.py": "7f4c3105ec06d2ac587aacfde92517b6d49da95b6f2b3940b41aee22258d0fff",
     "sglang/srt/rust_extensions/loader.py": "0c25123a7e1c051a7f285abdb0b4ac6f4591bcf2cefe07b100bb55bc24137c6d",
-    "sglang/srt/mem_cache/unified_radix_cache.py": "d9193bcb9e69073ba2dc337b2e8bdae7f9c94ca68d16a09d67ce0e2bf18822bd",
+    "sglang/srt/mem_cache/unified_radix_cache.py": (
+        "d9193bcb9e69073ba2dc337b2e8bdae7f9c94ca68d16a09d67ce0e2bf18822bd",
+        # The caller of the hooked create_tree_core (keyword call with name=).
+        bed.Functions(
+            {"UnifiedRadixCache.__init__": ("652f4f3aefd16c00", "7f4bde0c0cd3c006")}
+        ),
+    ),
 }
 
 _state = {"armed": False, "info": {}}

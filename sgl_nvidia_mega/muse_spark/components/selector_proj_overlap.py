@@ -42,10 +42,29 @@ PINS = {
     "sglang/srt/models/dflash.py": (
         "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
         "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "CandidateSelector.build_lattice": "082f523a978cabf6",
+                "CandidateSelector.__init__": ("7c18c0650837784e", "f4a5b164d7bfa159"),
+            }
+        ),
     ),
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        bed.Functions(
+            {
+                "_SelectorDraftSampler.__call__": (
+                    "01c164b1ef53ea15",
+                    "abf871e91cf76cbd",
+                ),
+                "_SelectorDraftSampler.__init__": (
+                    "bc029f9f317dd92e",
+                    "c046cc84f70f407f",
+                ),
+                "_selector_lattice": "5778979618f841b9",
+            }
+        ),
     ),
 }
 

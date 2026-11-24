@@ -55,14 +55,47 @@ PINS = {
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # gated_attention (sgl_shims' split of forward) as _prefill_path re-runs it, and the fused KV store it checks
+        bed.Functions(
+            {
+                "MuseSpark1xAttention.__init__": "6c44d00fb22adfb0",
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+                "MuseSpark1xAttention._fused_kv_store": (
+                    "a2a4beb31ffa8901",
+                    "4a021cb1e5759e85",
+                ),
+            }
+        ),
     ),
     "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
         "99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67",
         "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25",
+        # the Triton QK-norm call and kernel the plugin kernel reproduces, and its dispatch checks
+        bed.Functions(
+            {
+                "_qk_rms_norm_fwd_kernel": "2ac6993610b2867f",
+                "_triton_config": "fd52a809f56bbf75",
+                "FusedQKNorm.__init__": "83a7af467434ab7b",
+                "FusedQKNorm._store_kv": "b2fe6fbb1f29a23a",
+                "FusedQKNorm.backend_eligible": "e9a45fa9edf2007c",
+                "FusedQKNorm.forward_triton": "a6a635ff3bfb3675",
+                "FusedQKNorm._forward_triton": "835021d2e9d1e932",
+            }
+        ),
     ),
     "sglang/srt/layers/radix_attention.py": (
         "df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e",
         "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0",
+        # the attention call and its eager region, which forward the store keyword to the backend
+        bed.Functions(
+            {
+                "RadixAttention.forward": ("5973e131d911edc8", "4b66858e02f5f39d"),
+                "RadixAttention._eager_attention": (
+                    "e58c6ace1a3694e3",
+                    "8a7513cc48d5af64",
+                ),
+            }
+        ),
     ),
 }
 # The arithmetic reproduces the fused QK-norm Triton kernel as each validated Triton release compiles it
@@ -84,18 +117,48 @@ STORE_KW = "muse_vr_pqk_store"
 STORE_PINS = {
     "sglang/srt/layers/attention/trtllm_mha_backend.py": (
         "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+        # the fused FP8 q + KV store the store mode replaces (its conditions and buffers), and the q conversion
+        # of the native-NVFP4 extend path (q8 mode)
+        bed.Functions(
+            {
+                "TRTLLMHAAttnBackend.forward_extend": (
+                    "9ddde6d7d3f6d4be",
+                    "8e36076dafabff66",
+                ),
+                "TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
+                "TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (
+                    "208190898701e7b0",
+                    "363661c3585e6a0f",
+                ),
+                "TRTLLMHAAttnBackend._get_layer_cache_loc": (
+                    "9253a58925623e0c",
+                    "cbae0e93f3085edc",
+                ),
+                "TRTLLMHAAttnBackend._forward_extend_uses_native_fp4": "2ca6caa1239a837a",
+            }
+        ),
     ),
     "sglang/kernels/ops/kvcache/fused_fp8_qkv_kv_cache.py": (
         "88755d730cec527a7135aabff1c57779d11752ea7b286343c47c285a0be39fa3",
     ),
     "sglang/kernels/jit/csrc/attention/fused_fp8_qkv_kv_cache.cuh": (
         "1e28bbf79d380275353a7275f2d4ab7b77d15c102d8eb8677537637bafcea130",
+        # 3117f58 + #48948: only the device option kDLCUDA -> kDLGPU (the tensor checks); the kernel is unchanged
+        "3fd2bfa383a56d09ed1e3273baf0d8d88ce566ad0cbfa7c1ad631d5326d0ee7d",
     ),
     "sglang/srt/layers/attention/graph_utils.py": (
         "01b178e4c1248d19ce782aa7d8f8c4f292b87fbb7a5a20e250427a3eb1edf764",
+        # the eager region's output allocation (dtype follows v) and its keyword narrowing
+        bed.Functions(
+            {
+                "allocate_attention_outputs": ("ac27fca725355426", "18abcef1440a7266"),
+                "attention_input_scope": ("472c08e9d00321df", "a6f4c2299c36565d"),
+            }
+        ),
     ),
     "sglang/srt/layers/attention/base_attn_backend.py": (
         "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
+        bed.Functions({"AttentionBackend.forward": "bc5fa8fffe7afd20"}),
     ),
 }
 _store_state = {"engaged": False}

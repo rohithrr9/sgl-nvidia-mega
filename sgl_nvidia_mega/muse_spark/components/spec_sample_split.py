@@ -58,10 +58,29 @@ NUM_WARPS = 4  # the stock launch for the non-block-verification variant
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) this component relies on:
 # the kernel it mirrors and the call site whose arguments it receives.
 PINS = {
-    "sglang/kernels/ops/speculative/reject_sampling.py": "62caac17755082e2f89b1c81a743f55c81c31b7ff0485b7533c0267e72e9262c",
+    "sglang/kernels/ops/speculative/reject_sampling.py": (
+        "62caac17755082e2f89b1c81a743f55c81c31b7ff0485b7533c0267e72e9262c",
+        # The mirrored kernel is unchanged; the hooked launcher gained SGLang's own split paths (below the
+        # multiprocessor count, and block verification), and its classic launch is the same.
+        bed.Functions(
+            {
+                "speculative_sampling_classic_kernel": "3c0aae546abc7d8e",
+                "chain_speculative_sampling_triton": (
+                    "6148152b86c3c748",
+                    "6f333a07c08dcbe4",
+                ),
+            }
+        ),
+    ),
     "sglang/kernels/ops/speculative/dspark/dspark_accept.py": (
         "6202a51f6d2f3a79fef3cbef2aee04296640087be2402d8b11a7f1b394015a9c",
         "4d87d25d0510a309e7f3484c0d2c6d806da39bd5557096c49b9ac2a92e5c3ddf",
+        # The call site: the keyword call of chain_speculative_sampling_triton is unchanged on CUDA.
+        bed.Functions(
+            {
+                "_accept_sampling_core": ("0af3df5843db8b24", "2b354a14b1e4a76d"),
+            }
+        ),
     ),
 }
 

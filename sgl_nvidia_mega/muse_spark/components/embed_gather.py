@@ -40,6 +40,11 @@ PINS = {
     "sglang/srt/layers/vocab_parallel_embedding.py": (
         "5c4a96a8ad291f7601876368cec75769adc152b6af6fffe317ae5fc44d10d4d1",
         "c36f5682e528fafe922b88ad0e9dd418b7f9558762058858707a6a75c25ea5cf",
+        bed.Functions(
+            {
+                "VocabParallelEmbedding._embed_local_shard": "1ba107d387e253cb",
+            }
+        ),
     ),
     "sglang/kernels/ops/embeddings/vocab_parallel_embedding.py": "7766e50514e621317fec277fd5975adc469d70ab2951722a99d56afbb6dc16d4",
 }

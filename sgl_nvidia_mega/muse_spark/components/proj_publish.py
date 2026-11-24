@@ -26,8 +26,13 @@ code unchanged; the reason is counted.
 
 Numerics: the unpooler's TGV column-slice GEMM is bitwise equal to the replicated dispatch at the tested row counts (units),
 and the published values reach the boundary through SGLang's all-gather marker rule (an exact +0.0 half arrives as -0.0),
-as SGLang's own gathered path does. The pooler's slice GEMM differs from the replicated cuBLAS GEMM in summation order below
-136 rows on this image (a reduction-order class) and is bitwise above (units).
+as SGLang's own gathered path does at 306ccf6 (from 3117f58 SGLang's own path remaps only an all-zero 32-bit word). The
+pooler's slice GEMM differs from the replicated cuBLAS GEMM in summation order below 136 rows on this image (a
+reduction-order class) and is bitwise above (units).
+
+Plane: the Muse Spark collectives' lease on the tensor-parallel symmetric workspace (``muse_workspace()``) and its
+EpochCounter phase word (SGLang 3117f58 + #48948); the 306ccf6 form (the TP custom all-reduce's push plane with per-block
+phase counters) is not kept.
 """
 
 from __future__ import annotations
@@ -42,9 +47,18 @@ from . import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
-    "srt/models/muse_spark.py": ("MuseSpark1xDecoderLayer", "MuseSpark1xMoE"),
+    "srt/models/muse_spark.py": (
+        "MuseSpark1xDecoderLayer",
+        "MuseSpark1xMoE",
+        # the model module's names install() rebinds
+        "gemm_ag_supported",
+        "gemm_local",
+        "all_gather_norm_residual",
+        "bf16_gemm_dispatch",
+    ),
     "srt/layers/muse_spark/muse_spark_fp4_moe.py": ("MuseSpark1xFp4Experts",),
-    "srt/runtime_context.py": ("get_parallel", "get_forward"),
+    "srt/layers/communication/muse_spark_gemm_ag.py": ("muse_workspace",),
+    "srt/runtime_context.py": ("get_forward",),
 }
 
 
@@ -58,9 +72,50 @@ SITES_ENV = "MUSE_VR_PROJ_PUBLISH_SITES"
 DEFAULT_ROWS = (56, 336)
 DEFAULT_U_ROWS = (192, 288)
 H, EH = 8192, 4096
-# sha256 of the SGLang files whose names this component rebinds (306ccf6 layout)
+# The SGLang sources this component rebinds names of, calls, or copies kernels and the plane protocol from, at 3117f58 +
+# #48948 (the publish and consumer kernels follow its EpochCounter plane; 306ccf6's per-block counters are not kept)
 PINS = {
-    "sglang/srt/models/muse_spark.py": "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+    # the MoE call sites (pooler dispatch and prepare, unpooler gather with the lease) and the decoder layer's FFN boundary
+    "sglang/srt/models/muse_spark.py": (
+        bed.Functions(
+            {
+                "MuseSpark1xMoE.__init__": "38b36b568c633d3e",
+                "MuseSpark1xMoE._forward_tp": "1c1aa0fe77681cd0",
+                "MuseSpark1xMoE._forward_experts": "04c56c86a0d682b6",
+                "MuseSpark1xMoE._reduce_and_unpool": "84d2840940f3c49b",
+                "MuseSpark1xMoE._defers_unpool_gather": "c730eaaec130b50e",
+                "MuseSpark1xDecoderLayer.forward": "51e40503e316c464",
+            }
+        ),
+    ),
+    # the lease (the comm SGLang passes) and the unpooler's stock slice GEMM
+    "sglang/srt/layers/communication/muse_spark_gemm_ag.py": (
+        bed.Functions(
+            {"muse_workspace": "bf91cbde371bd1ae", "gemm_local": "5ddfc71a56e900f7"}
+        ),
+    ),
+    # the slab layout (push slots at offset 0, the local u64 phase word) and the communicator the kernels take
+    "sglang/srt/distributed/device_communicators/symm_workspace.py": (
+        bed.Functions(
+            {
+                "_Workspace.finalize": "9a3ce97166fdb429",
+                "WorkspaceLease.get_communicator": "f5b7ae089508b316",
+            }
+        ),
+    ),
+    # the FFN-boundary gather pub_ag_norm stands in for, and its deferral check
+    "sglang/kernels/ops/communication/muse_spark_all_gather_norm_residual.py": (
+        bed.Functions(
+            {
+                "all_gather_norm_residual": "c0df708450513d02",
+                "all_gather_norm_residual_supported": "acaf9761aae5908d",
+            }
+        ),
+    ),
+    # the phase protocol and the two kernels csrc/proj_publish.cuh includes and copies
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
+    "sglang/kernels/jit/csrc/muse_spark/all_gather_norm_residual.cuh": "c0a24427f1f952ec1c5a82dacb2133f68e519666e5879c440bde8c0e4e2e1aad",
+    "sglang/kernels/jit/csrc/muse_spark/norm_fp4_quant.cuh": "a1d08b5b20a5e1b0a5ab3c831a3f9f80297d8ba29bab267901da32c145053a94",
 }
 
 _state = {
@@ -97,10 +152,12 @@ def _in(rng, m: int) -> bool:
 
 
 def _comm():
-    from sglang.srt.runtime_context import get_parallel
+    # the plane SGLang's Muse Spark collectives use (and pass to gemm_local / all_gather_norm_residual): the lease on
+    # the tensor-parallel symmetric workspace (3117f58 + #48948; 306ccf6 used the TP custom all-reduce's push plane)
+    from sglang.srt.layers.communication.muse_spark_gemm_ag import muse_workspace
 
     try:
-        return get_parallel().tp_group.ca_comm
+        return muse_workspace()
     except Exception:  # noqa: BLE001
         return None
 

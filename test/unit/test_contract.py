@@ -147,6 +147,13 @@ def test_sglang_provides_what_the_plugin_reads(path):
         if files == _files(DRAFT_CHECK) and not _has_draft_check():
             skipped = [n for n in names if n in DRAFT_CHECK_NAMES]
             reason = NO_DRAFT_CHECK
+        if (
+            _id(path).startswith(MUSE_SPARK_PACKAGE)
+            and pattern in MUSE_SPARK_LEASE_READS
+            and not _has_muse_spark_lease()
+        ):
+            skipped = [n for n in names if n in MUSE_SPARK_LEASE_READS[pattern]]
+            reason = NO_MUSE_SPARK_LEASE
         if skipped:
             unchecked.append(f"{reason}: {_id(path)} reads {sorted(skipped)}")
             names = [n for n in names if n not in skipped]
@@ -246,6 +253,35 @@ NO_K31_HOST = "this SGLang has no Kimi K3.1 megakernel host bindings"
 
 def _has_k31_host() -> bool:
     return bool(_files(K31_HOST))
+
+
+# Muse Spark components ported to SGLang's Muse Spark workspace lease (nightly 3117f58 and
+# later) read names an older SGLang lacks; there their source pins fail and they step
+# aside, so these reads are checked only against an SGLang with the lease, naming each file.
+MUSE_SPARK_PACKAGE = "sgl_nvidia_mega/muse_spark/"
+MUSE_SPARK_LEASE = "srt/layers/communication/muse_spark_gemm_ag.py"
+MUSE_SPARK_LEASE_READS = {
+    "kernels/ops/communication/all_reduce.py": ("slot_bytes",),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "_max_push_size",
+        "choose_algo",
+        "forced_algo",
+    ),
+    "srt/layers/communication/muse_spark_gemm_ag.py": ("muse_workspace",),
+    "srt/mem_cache/memory_pool.py": ("window_write_locs",),
+    "srt/models/dflash.py": (
+        "_fused_candidate_all_gather",
+        "is_flashinfer_available",
+        "merge_candidates_fused",
+        "radix_topk",
+    ),
+}
+NO_MUSE_SPARK_LEASE = "this SGLang has no Muse Spark workspace lease (muse_workspace)"
+
+
+def _has_muse_spark_lease() -> bool:
+    files = _files(MUSE_SPARK_LEASE)
+    return bool(files) and "muse_workspace" in _provided(files[0])
 
 
 def _has_draft_check() -> bool:

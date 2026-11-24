@@ -3,7 +3,8 @@
 """Component ``draft_topk`` (env ``MUSE_VR_DRAFT_TOPK=1``, default off).
 
 The DFLASH candidate selector takes the top-k of the draft head's logits per draft position (``models/dflash.py``
-``_radix_topk``: ``flashinfer.top_k(..., sorted=True, deterministic=True)``, a radix select plus a stable sort). This
+``candidate_topk`` calls ``radix_topk``: ``flashinfer.top_k(..., sorted=True, deterministic=True)``, a radix select plus a
+stable sort). This
 component serves that call with one multi-CTA exact top-k kernel (``ops/draft_topk``, ``csrc/draft_topk.cuh``) for 2-D
 contiguous CUDA bf16/fp16/fp32 inputs with k <= 32 and at most 65536 columns; other calls run stock.
 
@@ -35,6 +36,7 @@ this run stock (counted ``stock:rows above max``), so the multi-CTA kernel can s
 from __future__ import annotations
 
 import logging
+import threading
 
 import torch
 
@@ -49,14 +51,29 @@ SGLANG_READS = {
 logger = logging.getLogger(__name__)
 
 NAME = "draft_topk"  # env MUSE_VR_DRAFT_TOPK
-TARGET = "sglang.srt.models.dflash._radix_topk"
+TARGET = "sglang.srt.models.dflash.radix_topk"
+# The hook registry also rebinds every other module's import of ``radix_topk`` (the verify sampler's top-k in
+# dflash_utils among them), so the hook serves only the calls made inside the draft's candidate computation. Registered
+# after draft_candidates (components order), this scope also covers that component's compute_candidates.
+T_SCOPE = "sglang.srt.models.dflash.DFlash2DraftModel.compute_candidates"
 
+# radix_topk (sglang.kernels.ops.sampling.topk) replaced dflash's own _radix_topk; the sha256 entries of the revisions
+# that had _radix_topk are gone
 PINS = {
     "sglang/srt/models/dflash.py": (
-        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
-        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "candidate_topk": "5e55ac0c8feed838",
+                "DFlash2DraftModel.compute_candidates": "67d87a7938370c2c",
+            }
+        ),
+    ),
+    "sglang/kernels/ops/sampling/topk.py": (
+        bed.Functions({"radix_topk": "4bd1e941f2b2bd60"}),
     ),
 }
+
+_scope = threading.local()
 
 
 def enabled() -> bool:
@@ -70,7 +87,18 @@ def pins_match() -> tuple[bool, str]:
     return True, "ok"
 
 
+def around_compute_candidates(original, *args, **kwargs):
+    depth = getattr(_scope, "depth", 0)
+    _scope.depth = depth + 1
+    try:
+        return original(*args, **kwargs)
+    finally:
+        _scope.depth = depth
+
+
 def around_radix_topk(original, scores, k, *args, **kwargs):
+    if not getattr(_scope, "depth", 0):
+        return original(scores, k, *args, **kwargs)  # not the draft's candidate top-k
     from .ops import draft_topk as op
 
     if (
@@ -143,5 +171,6 @@ def register() -> bool:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     HookRegistry.register(TARGET, around_radix_topk, HookType.AROUND)
+    HookRegistry.register(T_SCOPE, around_compute_candidates, HookType.AROUND)
     bed.report(NAME, True)
     return True

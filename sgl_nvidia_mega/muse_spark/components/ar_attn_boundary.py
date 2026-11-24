@@ -16,7 +16,8 @@ the stock boundary would run its JIT kernel, and the row count is within ``MUSE_
 bench/bench_ar_norm_residual.py). Every other call runs SGLang's own forward.
 
 Engagement requires the sha256 of every SGLang source the fused path mirrors (including ``parallel_state.py``, whose
-all-reduce dispatch ``_stock_ar_is_one_shot_push`` reproduces) to match the pinned revision. Engagement is recorded
+all-reduce dispatch ``_stock_ar_is_one_shot_push`` reproduces) to match the pinned revision, or, for a ``bed.Functions``
+entry, the token digests of the functions it relies on there. Engagement is recorded
 with ``bed.report``; fused call sites seen at CUDA-graph capture or in eager steps are tallied per row count with
 ``bed.count``.
 
@@ -58,7 +59,6 @@ SGLANG_READS = {
     ),
     "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
     "srt/runtime_context.py": ("get_forward", "get_parallel"),
-    "srt/distributed/*.py": ("get_tp_group",),
     "srt/models/muse_spark.py": ("_use_split_bf16_router",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
@@ -88,30 +88,98 @@ PINS = {
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # the hooked layer forward (mirrored around the deferred all-reduce) and the attention forward it inlines
+        bed.Functions(
+            {
+                "MuseSpark1xDecoderLayer.forward": (
+                    "51e40503e316c464",
+                    "16062a0b89c4ee50",
+                ),
+                "MuseSpark1xDecoderLayer.__init__": "e8d853ff24c4ff47",
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+                "_use_split_bf16_router": ("61af1e739a14e950", "ff489cecea2cba94"),
+            }
+        ),
     ),
     "sglang/kernels/ops/muse_spark_v12/fused_norm_residual.py": (
         "61be2075b233c687f7b111bae06d4f9494c3032a8b0c2289c9ae10fc8c757493",
         "454f084d20e5f2353a70d260ea4a70c7dfdff3bf45a58619ef72e1eec2646fe3",
+        bed.Functions(
+            {
+                "FusedPostNormResidualPreNorm.__init__": "f58540129118cd68",
+                "FusedPostNormResidualPreNorm._triton_supported": "f6c23ac420a1de48",
+                "FusedPostNormResidualPreNorm._ensure_cached_weights": "5ec64f255028acea",
+                "FusedPostNormResidualPreNorm.jit_kernel_kwargs": "f3ddcac4283845af",
+                "FusedPostNormResidualPreNorm.jit_selected": "99e7002206e118d5",
+                "FusedPostNormResidualPreNorm.forward_jit": "3878afc5a00035cb",
+                "FusedPostNormResidualPreNorm.backend_eligible": "68d640502c94d3dd",
+            }
+        ),
     ),
     "sglang/kernels/ops/muse_spark_v12/norm_residual.py": (
         "7b63c2e855371e50d291b684e09135ac466f5a1444f75ce87f591b68dd47223a",
         "76bd0c26ed4d3cf87126619c72a56de908dea0ea1b2c69f6e5ada47318035cbe",
+        # the boundary kernel's launch policy (ar_norm_residual.launch_config mirrors fused_norm_residual's)
+        bed.Functions(
+            {
+                "_cluster_launch_config": "c452484293b41a96",
+                "_cluster_size_for_shape": "86fe115c0cf73957",
+                "_cluster_num_threads": "41338200a597223f",
+                "_launch_config": "6e723da04f97ee09",
+                "norm_residual_launch_config": "f17e9aca194a4569",
+                "fused_norm_residual": ("975cd488a7dc2b2a", "2c23bbac7ad02b49"),
+            }
+        ),
     ),
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_residual.cuh": "c227348c4d705183d377ac623a62b1ed6957eb8832fb0508f4ac99f1aa3cb0c8",
-    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": (
-        "ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258",
-        "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a",
+    # the second: SGLang 3117f58 + #48948 (only its mbarrier include moved to sgl_kernel/ptx/barrier.cuh)
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_residual.cuh": (
+        "c227348c4d705183d377ac623a62b1ed6957eb8832fb0508f4ac99f1aa3cb0c8",
+        "1bced24bcdc40d2cadb3ef6120d1adbfeaa5b3900eb9d3c91beebac020b42f4b",
     ),
-    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
+    # SGLang 3117f58 + #48948 only: the fused kernels follow its push-plane protocol (one EpochCounter phase word per plane)
+    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": "fc38106be27066e0c691ce93e3b42435fb9b23f41830dd748104442d79c4915b",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
+    # SGLang 3117f58 + #48948 only (the gates read CustomAllReduceV2._max_push_size)
     "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
-        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+        bed.Functions(
+            {
+                "CustomAllReduceV2.__init__": "6871008b7ea3d24e",
+                "CustomAllReduceV2.should_custom_ar": "cb50aca228bfb484",
+                "CustomAllReduceV2.uses_one_shot_push": "b0f783101793ce04",
+                "CustomAllReduceV2.custom_all_reduce": "a10d0b9bb845cf6d",
+                "CustomAllReduceV2.obj": "4eba547724199cb9",
+                "CustomAllReduceV2.has_multicast": "41330e6743a2e1ad",
+            }
+        ),
     ),
     "sglang/srt/distributed/parallel_state.py": (
         "49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7",
         "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d",
+        # the all-reduce dispatch _stock_ar_is_one_shot_push / _stock_ar_is_custom reproduce
+        bed.Functions(
+            {
+                "GroupCoordinator.all_reduce": ("82c44defd3291bd6", "200c9d593d1e15eb"),
+                "GroupCoordinator._resolve_outplace_all_reduce_method": (
+                    "a107b53ca635241b",
+                    "01b4a6609d2e94b3",
+                ),
+                "GroupCoordinator._can_use_flashinfer_allreduce": "a1ce45c67d8629b4",
+                "GroupCoordinator._all_reduce_out_place": (
+                    "71c33c4f1f17247e",
+                    "244a957ddf2e362b",
+                ),
+                "outplace_all_reduce": "473d72b84304bb96",
+            }
+        ),
     ),
-    "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+    "sglang/srt/layers/linear.py": (
+        "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+        bed.Functions(
+            {
+                "RowParallelLinear.forward": ("1d5fb1eabbb87ec4", "b291a3c452e428a5"),
+            }
+        ),
+    ),
 }
 
 
@@ -326,7 +394,7 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
         bed.count(NAME, "stock:" + reason)
         return original(layer, positions, stream, attn_input, forward_batch)
 
-    from sglang.srt.distributed import get_tp_group
+    import sglang.srt.models.muse_spark as ms
     from sglang.srt.models.muse_spark import _use_split_bf16_router
     from sglang.srt.runtime_context import get_parallel
 
@@ -457,8 +525,15 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
     else:
         ffn_output = layer.mlp(ffn_input)
     if ffn_output.shape[-1] != stream.shape[-1]:
+        # the comm the revision's own decoder layer passes: the Muse Spark workspace lease (muse_workspace(), a
+        # WorkspaceLease, None without one) where the model module has it, else the TP custom all-reduce
+        ag_comm = (
+            ms.muse_workspace()
+            if hasattr(ms, "muse_workspace")
+            else get_parallel().tp_group.ca_comm
+        )
         next_attn_input, stream = layer._fused_ffn_boundary.forward_with_ag(
-            stream, ffn_output, get_tp_group().ca_comm
+            stream, ffn_output, ag_comm
         )
         return stream, next_attn_input
     if layer._fused_ffn_boundary is None:

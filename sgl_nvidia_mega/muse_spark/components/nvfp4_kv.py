@@ -118,7 +118,7 @@ from . import bed
 SGLANG_READS = {
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
     "srt/arg_groups/resolution_hooks.py": ("register_resolution_hook",),
-    "srt/utils/common.py": ("is_float4_e2m1fn_x2",),
+    "srt/utils/device.py|srt/utils/common.py": ("is_float4_e2m1fn_x2",),
     "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool",),
 }
 
@@ -132,72 +132,221 @@ SGLANG_PINS = {
     "sglang/srt/arg_groups/kv_cache_hook.py": (
         "cca1d08b1e06d3ada9c765c6ed93cf880024194e3a194bc90509b790d621fa97",
         "ff60f663c4b5dc147cee95cb01892bca34c870139d6d384d823087bb5567f318",
+        # the stock step nvfp4_kv_resolution copies
+        bed.Functions({"handle_kv4_compatibility": "e065c7b6083e8985"}),
     ),
     "sglang/srt/arg_groups/resolution_hooks.py": (
         "09a255a23f107fb37792aa14dc76052ebf7a347894a39a56a2c519fdc7be5be4",
         "223cad17d8ae0be65cf4058330148fd76f7566a5e949c288006dbf228763407a",
+        bed.Functions(
+            {
+                "register_resolution_hook": "6d5e98f2452d98ed",
+                "run_hook": "5771ad49b6ecbb5c",
+            }
+        ),
     ),
     "sglang/srt/arg_groups/overrides.py": (
         "e7887fe00392f2eb7de91655692bf2da0a58edb9caf397fd06b137800dbaa544",
         "f3455f5465c678de9ab578c238424bb92fde4e652159056ae955cca2d8711c4a",
+        bed.Functions(
+            {
+                "declare_resolution": "6cb7f28ba1225c23",
+                "post_capture_kv_sizing_planned": (
+                    "16fa95522ff47844",
+                    "a5143401078af1ed",
+                ),
+            }
+        ),
     ),
     "sglang/srt/mem_cache/kv_cache_configurator.py": (
         "570b22f6aca4d7bb2330fc15a5912ee2f61e500626cce21d69c27e71ec132fb2",
         "5f7f4132923880cb2aa58ef55a5b18233df20bf1ffd47eb0d27b9781a8226c67",
+        # the hybrid pool builder nvfp4_kv_pool copies, and the quant-method builder it calls
+        bed.Functions(
+            {
+                "KVCacheConfigurator._build_hybrid_swa_kv_pool": "589c8f0e74b6f106",
+                "KVCacheConfigurator._build_mha_quant_method": "c2f53a89e504d057",
+            }
+        ),
     ),
-    "sglang/srt/mem_cache/kv_cache_dtype.py": "2ecb9e1444588f5a8d6f8ecc1b99b96b692fcfedd655c2d5533955ddd84d69a8",
+    "sglang/srt/mem_cache/kv_cache_dtype.py": (
+        "2ecb9e1444588f5a8d6f8ecc1b99b96b692fcfedd655c2d5533955ddd84d69a8",
+        # the fa4 DFLASH draft keeps a compute-dtype pool (module docstring)
+        bed.Functions(
+            {"configure_kv_cache_dtype": ("aca62428ed72686d", "ea274f1cfa8cd8c1")}
+        ),
+    ),
     "sglang/srt/model_executor/pool_configurator.py": (
         "d6e49edf1d7f6cd23f435257b0230b97fb23d401051c36e1c3b386b24b018c2d",
         "abcadf80aa7dceb6eb1c54735132ec300f1e150d52cd9d95a6bac23620b90ac5",
+        # the per-token estimate fix_hybrid_sizer replaces
+        bed.Functions(
+            {
+                "HybridSWAPoolConfigurator.__init__": (
+                    "9d05903465f426e0",
+                    "5841a27c506ac1ac",
+                ),
+                "HybridSWAPoolConfigurator._recompute_cell_size": "cf1e80ad7cc0d50b",
+            }
+        ),
     ),
+    # nvfp4_kv_verify writes K/V through the backend's per-layer store (the forward_extend of SGLang 3117f58 + #48948):
+    # the 306ccf6-era revisions are no longer accepted.
     "sglang/srt/layers/attention/trtllm_mha_backend.py": (
-        "566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4",
-        "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+        bed.Functions(
+            {
+                "_trtllm_native_nvfp4_kv_buffer": "b1eefc52aca9ab91",
+                "TRTLLMHAAttnBackend.__init__": "70a9364ba6b6c920",
+                "TRTLLMHAAttnBackend.forward_extend": "9ddde6d7d3f6d4be",
+                "TRTLLMHAAttnBackend._forward_extend_uses_native_fp4": "2ca6caa1239a837a",
+                "TRTLLMHAAttnBackend._get_nvfp4_bmm_scales": "c32d1763f0dc82b8",
+                "TRTLLMHAAttnBackend._get_layer_page_table": "2a2d3e0c63990341",
+                "TRTLLMHAAttnBackend._finalize_nvfp4_output": "dab14cab14ec00a2",
+                "TRTLLMHAAttnBackend._get_nvfp4_decode_kv_cache": "da9dc03796ede9b2",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/swa_memory_pool.py": (
         "5d518102fad0bb444176815e1e829a63197b6939ff656bf282253ffa09c90fab",
         "14f2b1daebdc9d872b5786cfc0beed26a413bb41717b70a737a4cb4c31951dfc",
+        bed.Functions(
+            {
+                "SWAKVPool.__init__": ("3f1c9a5f1d7bc949", "1caa6cf362761a29"),
+                "SWAKVPool._wait_for_layer": "a6353713c0bf606b",
+                "SWAKVPool.get_kv_buffer": "6a56056d00ec5af1",
+                "SWAKVPool._build_layer_router": "91d33a672b259ae3",
+            }
+        ),
     ),
+    # KVWriteLoc.for_batch(window_locs=) / window_write_locs (nvfp4_kv_verify's KV write): SGLang 3117f58 + #48948 only.
     "sglang/srt/mem_cache/memory_pool.py": (
-        "b439441448d1112952876cd5f814ea47fcd561ece1a9aa0e7d2080d5f4874106",
-        "f3e12b293f3bdce21604ca5e5b473c07dcb6c8e4a34b582c4498d0bd45a10900",
+        bed.Functions(
+            {
+                "KVWriteLoc.for_batch": "d166d5aeecef6667",
+                "window_write_locs": "89857db516d228ff",
+                "MHATokenToKVPool.set_kv_buffer": "e22a1c2362ca14c5",
+                "MHATokenToKVPool._set_quantized_kv_buffer": "e1534a15bde8eb51",
+                "MHATokenToKVPool._create_buffers": "ae88fad8b3bf3e1c",
+                "MHATokenToKVPool._create_quantized_buffers": "4cb958db75bb8748",
+                "MHATokenToKVPool._mha_buffer_info": "4c8a662590be03b4",
+                "MHATokenToKVPool.get_device_pool_infos": "d71b509f1c35e198",
+            }
+        ),
     ),
-    "sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py": "9800db3ab0968c921ca66ce806f1e842b9c61d4db577358712d6fdd0466de2d2",
+    "sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py": (
+        "9800db3ab0968c921ca66ce806f1e842b9c61d4db577358712d6fdd0466de2d2",
+        bed.Functions(
+            {
+                "KVCacheQuantMethodBase.configure_attention_backends_from_server_args": (
+                    "e5c51d9746dba0b4",
+                    "c3bb04ed8354b003",
+                ),
+                "NVFP4KVCacheMethod.__init__": "3f5be82e4410acea",
+                "NVFP4KVCacheMethod.needs_native_fp4_scales": "8877358b82edd878",
+                "NVFP4KVCacheMethod.needs_linear_scale_buffer": "c18ff22b9b7564e3",
+                "NVFP4KVCacheMethod.scale_buffer_view_dtype": "71102508a89958d8",
+                "NVFP4KVCacheMethod.load_scales_from_model": "2dbe698a6b06cf25",
+                "NVFP4KVCacheMethod.get_bmm_scales": "6706186149229c30",
+                "NVFP4KVCacheMethod.create_buffers": "04d85e10d5a9cd78",
+                "NVFP4KVCacheMethod.quantize_and_store": "e4085b35c07293f3",
+                "NVFP4KVCacheMethod.compute_cell_size": "a7e423fd2f70615a",
+                "get_kv_cache_quant_method": "f12d31679fd0682c",
+            }
+        ),
+    ),
     "sglang/srt/layers/quantization/nvfp4_kv_cache.py": "a0511ad263e22b0d0343cb5befbbfe73fde6a72d1efb8c50b166e01078460ae8",
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        # DFLASH's prefix-valid KV writes go to the draft pool only (the resolution part relies on it)
+        bed.Functions(
+            {
+                "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": (
+                    "4c2eab09c6743c2d",
+                    "703e46d714f062ea",
+                ),
+                "DFlashWorkerV2._append_target_hidden_fused": (
+                    "c40ffaf1f6f3074f",
+                    "d3353a4a8205b48e",
+                ),
+            }
+        ),
     ),
 }
 HOST_POOL_PINS = {
+    # MHATokenToKVPoolNVFP4HostMain passes host_token_capacity (SGLang 3117f58 + #48948): the 306ccf6-era revisions are
+    # no longer accepted for the host pool and its MXFP8 template.
     "sglang/srt/mem_cache/pool_host/mha.py": (
-        "58962740251a936c1a940cc382fcc22eccd34d68120700ec790d3f9a6b150aa4",
-        "bdc20a7643e0b98eb774a46c781cb048f579396f696169689b3616b7f0dc91b6",
+        bed.Functions(
+            {
+                "MHATokenToKVPoolHost.__init__": "61c36d24f8cf7c7a",
+                "MHATokenToKVPoolHost.get_size_per_token": "b2072ec2fa881e93",
+                "MHATokenToKVPoolHost._init_write_back_staging_buffers": "151a7e490ebd0a08",
+                "MHATokenToKVPoolHost.backup_from_device_all_layer": "57c64bd87dc8603c",
+                "MHATokenToKVPoolHost.load_to_device_per_layer": "0bc1176fc1c439f6",
+                "get_mha_host_pool_cls": "390d65933d335314",
+                "prepare_mha_write_back_staging": "ee25e5f947045afc",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/pool_host/mha_mxfp8.py": (
-        "9a167bd9adfc1e1945ccb5eb292757eea308175a6f485cb7f6cb82b38286f394",
-        "e0c0842585e4f94e95b7825ebcc80f38e7b02fd0b0684ca834275257f11bb830",
+        # the template nvfp4_kv_host follows
+        bed.Functions(
+            {
+                "MHATokenToKVPoolMXFP8Host.__init__": "91cdfc4fb0db8567",
+                "MHATokenToKVPoolMXFP8Host.get_size_per_token": "4b59f47295312cfa",
+                "MHATokenToKVPoolMXFP8Host.get_mapping_lengths": "4fbf39e2381738b4",
+                "MHATokenToKVPoolMXFP8Host._init_scale_buffers": "8e068b6885087247",
+                "MHATokenToKVPoolMXFP8Host.backup_from_device_all_layer": "3958473b6c79082b",
+                "MHATokenToKVPoolMXFP8Host.load_to_device_per_layer": "3d25c67c7aaee057",
+                "MHATokenToKVPoolMXFP8Host.destroy": "57d409e07534d156",
+            }
+        ),
     ),
     # SGLang main only (host pools built from buffer descriptions); absent on the branch layout
     "sglang/srt/mem_cache/device_pool_info.py": (
         "absent",
         "728ac7605216fc149a47278654cd70388d5237ca3462a7b3d952303a01cb2837",
+        bed.Functions({"MHABufferInfo.validate": "d35b5f4a10f0423c"}),
     ),
     "sglang/srt/mem_cache/pool_host/base.py": (
         "982db6b57fe90ced7d9b052f8ce965c48ccfec7f4d71ec9cdab03cbce253ad4c",
         "e57a060e2fd54905a4f16c4e440bafb8356f1967713c8a50f2667b2057d65bf6",
+        bed.Functions(
+            {
+                "HostKVCache.__init__": "cc828c6036a3aa46",
+                "HostKVCache.get_mapping_lengths": "2fcc88c7f8670f3f",
+            }
+        ),
     ),
+    # _mha_host_inputs(pool, info, drafts) returns (class, kwargs) on SGLang 3117f58 + #48948: the 306ccf6-era revisions
+    # are no longer accepted.
     "sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py": (
-        "35365ec237d193ac77b5adbba9fe239cde205e3747b0da635d3491126b594ac7",
-        "a5e1156a9db13593641ea9d649769761ce745fe82cf17c087a59b300d67e17ae",
+        bed.Functions(
+            {
+                "_mha_host_inputs": "63404b3b2fe7eca7",
+                "build_kv_host_pool": "79a3c8431afd4ab8",
+                "build_hybrid_swa_group": "86834026de4c38d9",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/kv_cache_builder.py": (
         "79808d4f054dc9edbae0c5c1e2d92818442d74b8a66381f6835eaa64f135853c",
         "578ce61e11904331f6a0bf7d85bf7f5679249b4d1a6718860a9c71b44ad45147",
+        bed.Functions(
+            {"prepare_hicache_staging": ("e0ba2c6f0d976aff", "ae0d76bbd3059439")}
+        ),
     ),
     "sglang/kernels/ops/kvcache/hicache.py": (
         "78ecd67d91a8a371a069db722e8f9cc2159e09f616487f659ef971acf7f73071",
         "f26aa62750f30ae9ce7a49ced671407daa97e3334288f8d335d51d666c5cc97d",
+        bed.Functions(
+            {
+                "transfer_hicache_all_layer_mla_staged_lf_pf": "5a38bdba9de6b023",
+                "transfer_hicache_one_layer_mla": "9fa2dca178e264f9",
+                "can_use_write_back_jit_kernel": "622c332574ead9b7",
+            }
+        ),
     ),
 }
 # sha256 of files relative to the directory that holds the ``flashinfer`` package.
@@ -205,10 +354,12 @@ FLASHINFER_PINS = {
     "flashinfer/decode.py": (
         "8917d7f1a80707d823455d69d105d90a57e8bb8a71b248348f02d62c547a6f91",  # FlashInfer 0.7.1 (device check)
         "de1f242bf2f598bc973a9d2f9625f8db1e4ccfc24085f686b2d0304c9076b20d",  # FlashInfer 0.7.2 (no device check)
+        "38fecaeff6eef57b2ea48fb8fe0bc06069970999c2edf34b1487ca0fc35edae3",  # FlashInfer 0.7.4 (no device check)
     ),
     "flashinfer/prefill.py": (
         "0f1f9e03a7aa59ab9b95f270b85b240041717f3e08ee20c30d1332d5136d19a0",  # FlashInfer 0.7.1 (device check)
         "531e220624ebc543fe865b1f6f078c5646233abc287b8407ac955e26d44f73b8",  # FlashInfer 0.7.2 (no device check)
+        "7dd28922ca85177d03294543d9ef44493627c99c5b4e4b4b49ad3a3bdfcf1c39",  # FlashInfer 0.7.4 (no device check)
     ),
 }
 
@@ -479,7 +630,7 @@ def _install_resolution() -> bool:
 
 
 def _is_nvfp4(dtype_str, dtype) -> bool:
-    from sglang.srt.utils.common import is_float4_e2m1fn_x2
+    from sglang.srt.utils import is_float4_e2m1fn_x2
 
     return dtype_str == "nvfp4" and is_float4_e2m1fn_x2(dtype)
 
@@ -713,12 +864,11 @@ def _host_inputs_around(original, pool, *args, **kwargs):
     """SGLang main: a native NVFP4 pool gets the NVFP4 host class plus its native scale tiles."""
     from . import nvfp4_kv_host
 
-    cls, info, mha_kwargs = original(pool, *args, **kwargs)
+    cls, mha_kwargs = original(pool, *args, **kwargs)
     if not nvfp4_kv_host.is_native_nvfp4_pool(pool):
-        return cls, info, mha_kwargs
+        return cls, mha_kwargs
     return (
         nvfp4_kv_host.MHATokenToKVPoolNVFP4HostMain,
-        info,
         dict(
             mha_kwargs,
             native_k_scales=tuple(pool.native_k_scale_buffer),

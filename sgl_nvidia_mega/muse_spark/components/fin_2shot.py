@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``fin_2shot`` (env ``MUSE_VR_FIN_2SHOT=1``, default off): wide decode / verify MoE finalize calls fused with a
-TWO-SHOT push all-reduce on the tensor-parallel communicator's own push plane, in the form of SGLang pull request 46724
-(``vendor/sglang_pr46724``: its finalize op, CuTe-DSL kernel and workspace).
+TWO-SHOT push all-reduce on the tensor-parallel workspace's push plane, in the form of SGLang pull request 46724
+(``vendor/sglang_pr46724``: its finalize op and CuTe-DSL kernel, the kernel's slot poll bounded) with SGLang's own
+``FinalizePushWorkspace``, which on 3117f58 + #48948 is the pull request's workspace on the TP symmetric workspace lease.
 
-Stock SGLang fuses the routed-MoE finalize (unpermute, post-expert RMSNorm, weighted top-k sum) with a ONE-shot push
-all-reduce up to 384 rows (``FinalizePushWorkspace``) and above that runs the finalize and a standalone all-reduce. The
-pull request adds a two-shot exchange to the same kernel (reduce-scatter by column slice in source-rank order, then a gather
-of the reduced slices) and uses it where the communicator's table picks ``2shot_push``. SGLang 306ccf6's 4-rank table never
-picks ``2shot_push``, so this component forces the two-shot form for ``MUSE_VR_FIN_2SHOT_MIN_M <= M <=
-MUSE_VR_FIN_2SHOT_MAX_M`` (defaults 176 and 1024) and leaves every other call (in particular every M below MIN_M) on
-SGLang's own op unchanged.
+SGLang fuses the routed-MoE finalize (unpermute, post-expert RMSNorm, weighted top-k sum) with a ONE-shot push
+all-reduce up to 384 rows (``FinalizePushWorkspace``) and, where the communicator's table picks ``2shot_push``, with the
+pull request's two-shot exchange (reduce-scatter by column slice in source-rank order, then a gather of the reduced
+slices); elsewhere it runs the finalize and a standalone all-reduce. This component forces the two-shot form for
+``MUSE_VR_FIN_2SHOT_MIN_M <= M <= MUSE_VR_FIN_2SHOT_MAX_M`` (defaults 176 and 1024) whatever the table picks, and leaves
+every other call (in particular every M below MIN_M) on SGLang's own op unchanged.
 
 Hooks (all on the pinned SGLang revision):
-- AFTER ``MuseSpark1xMoE.set_finalize_ar_workspace``: once per stock workspace, a pull-request workspace on the same
-  communicator, group, width and multicast setting (model construction, every rank, outside CUDA-graph capture).
+- AFTER ``MuseSpark1xMoE.set_finalize_ar_workspace``: once per stock workspace, a workspace of this component on the same
+  lease, all-reduce policy, group, width and multicast setting (model construction, every rank, outside CUDA-graph
+  capture).
 - AROUND ``MuseSpark1xMoE._forward_tp``: for a decode / verify call that the stock conditions would fuse except for the row
   cap (non-SP, bf16, expert-TP 1, the workspace's own ``can_fuse``) with M in range, the stock statements of the fused
   branch with that workspace: ``_forward_experts(..., ar_workspace=ws)`` then ``_reduce_and_unpool(output,
@@ -23,8 +24,9 @@ Hooks (all on the pinned SGLang revision):
   pull request's op (``ar_two_shot`` from the workspace); all others run SGLang's op.
 
 Numerics: rank-order fp32 sums with one bf16 rounding, as the pull request states; bitwise to SGLang's fused one-shot path
-where that exists (to 384 rows), value-equal class (a few elements a few ULP) against SGLang's separate finalize +
-all-reduce above it. Exclusive with ``fin2`` (same op hook). Decisions are counted under ``fin_2shot`` in ``bed``.
+where that exists (to 384 rows) and to its fused two-shot (the same kernel code but for the poll bound) where its table
+picks ``2shot_push``, value-equal class (a few elements a few ULP) against SGLang's separate finalize + all-reduce
+elsewhere. Exclusive with ``fin2`` (same op hook). Decisions are counted under ``fin_2shot`` in ``bed``.
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ from . import bed
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_forward", "get_parallel"),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+    "srt/layers/communication/muse_spark_finalize_workspace.py": (
+        "FinalizePushWorkspace",
+    ),
 }
 
 
@@ -49,18 +54,33 @@ OP_MODULE = "sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce
 T_OP = OP_MODULE + ".FusedPostExpertNormWeightedSumTRTLLM.forward_cute_dsl"
 T_TP = "sglang.srt.models.muse_spark.MuseSpark1xMoE._forward_tp"
 T_SET = "sglang.srt.models.muse_spark.MuseSpark1xMoE.set_finalize_ar_workspace"
+# SGLang 3117f58 + #48948 only: the vendored kernel takes the push plane's phase as SGLang's kernel there does (one
+# EpochCounter word shared by every kernel on the plane), and the workspace is SGLang's lease-based class.
 PINS = {
+    # SGLang's finalize kernel, which shares the push plane (and its phase protocol) with the vendored one
     "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py": (
-        "9e503382ec0d904476aa039d77510486cc71563c2e1a8bfcbb8d9234e7e2e689"
+        "fb819abb9d771fcd0e4bc085380daf6ea40b4931c1966f61da86d7abe4683398"
     ),
     "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce.py": (
-        "b22ba8b4d895fd38c99a0835b5a37b82adaa8e7587379f09807cb072eceb9948"
+        "f58cf0bacbeb9d03d545094854d076a7022caddf248f5d2c3c1ab21c8558b011"
     ),
     "sglang/srt/layers/communication/muse_spark_finalize_workspace.py": (
-        "578c07d454011b0972ff22bb017a015d13ce03bf61fd3445497c313d0ab3de3a"
+        "af5a6f6074e23a070904eff0abf6f514baf14d5401382e41f9920ec67a58ee70"
     ),
     # MuseSpark1xMoE._forward_tp's fused branch is reproduced statement for statement from this revision
-    "sglang/srt/models/muse_spark.py": "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+    "sglang/srt/models/muse_spark.py": (
+        "b49ff244e2f8617363c5cf2827d81086bff969391a4b83ba1c20420754bfea22",
+        bed.Functions(
+            {
+                "MuseSpark1xMoE._forward_tp": "1c1aa0fe77681cd0",
+                "MuseSpark1xMoE.set_finalize_ar_workspace": "7b952509c2761100",
+                "MuseSpark1xMoE._forward_experts": "04c56c86a0d682b6",
+                "MuseSpark1xMoE._reduce_and_unpool": "84d2840940f3c49b",
+                "MuseSpark1xMoE.__init__": "38b36b568c633d3e",
+                "MuseSpark1xModel.__init__": "494fbc30068c6846",
+            }
+        ),
+    ),
 }
 
 _state: dict = {"ws": {}, "cls": None, "op": {}}
@@ -88,14 +108,20 @@ def pins_match() -> tuple[bool, str]:
 def workspace_class():
     """The pull request's workspace with its fused two-shot forced on in MIN_M..MAX_M (capped at its slot capacity)."""
     if _state["cls"] is None:
-        from .vendor.sglang_pr46724 import muse_spark_finalize_workspace as pr_ws
+        from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
+            FinalizePushWorkspace,
+        )
 
-        class TwoShotFinalizeWorkspace(pr_ws.FinalizePushWorkspace):
+        class TwoShotFinalizeWorkspace(FinalizePushWorkspace):
             def __init__(
-                self, communicator, device_group, hidden_dim, *, multicast, lo, hi
+                self, lease, policy, hidden_dim, *, device_group, multicast, lo, hi
             ):
                 super().__init__(
-                    communicator, device_group, hidden_dim, multicast=multicast
+                    lease,
+                    policy,
+                    hidden_dim,
+                    device_group=device_group,
+                    multicast=multicast,
                 )
                 self.lo = int(lo)
                 self.hi = int(min(hi, self.two_shot_max_tokens))
@@ -119,11 +145,13 @@ def _after_set_workspace(result, self, workspace, *args, **kwargs):
         return result
     try:
         cls = workspace_class()
+        # the stock workspace's constructor arguments (MuseSpark1xModel.__init__)
         ws = cls(
-            workspace.communicator,
-            workspace.group,
+            workspace.lease,
+            workspace.policy,
             workspace.hidden_dim,
-            multicast=workspace.multicast,
+            device_group=workspace.group,
+            multicast=workspace.wants_multicast,
             lo=min_m(),
             hi=max_m(),
         )

@@ -51,6 +51,15 @@ PINS = {
     "sglang/srt/model_executor/forward_batch_info.py": (
         "9fedcb5d0415ba719d1f996f99b831de29f903faeb32f3da180bdc5ac9b02a99",
         "d15f12fa976acae9ba0bd4950b9366d1873abd46a8de66fd8c6ce45e3f0894f9",
+        # Newer layout: init_new calls _init_num_token_non_padded, which holds the guarded copy (or, with
+        # SGLANG_ENABLE_MLP_SYNC_METADATA_FILL, a kernel write) and is the flag's only caller in the module.
+        bed.Functions(
+            {
+                "ForwardBatch.init_new": "7dd1a863f9d52217",
+                "ForwardBatch._init_num_token_non_padded": "e2135be4373be057",
+                "enable_num_token_non_padded": "12b299d5080e6533",
+            }
+        ),
     ),
 }
 

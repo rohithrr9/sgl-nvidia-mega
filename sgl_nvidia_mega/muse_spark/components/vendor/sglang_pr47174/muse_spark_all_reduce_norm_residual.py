@@ -9,6 +9,8 @@
 # outside the range the plugin engages) is dropped. The exchange, the norm and every other launch choice are unchanged.
 # Modified by NVIDIA: the kernel's slot poll bound is passed at build time (MUSE_VR_K47_MAX_POLLS, default 2^27 unsuccessful polls)
 # and is part of the JIT module name, so builds with different bounds never share a cache entry.
+# Modified by NVIDIA: the push slot gate reads CustomAllReduceV2._max_push_size (SGLang 3117f58 renamed max_push_size);
+# the cluster-grid gate is kept as it was (same engagement) although 3117f58's plane no longer needs a counter per block.
 """Push all-reduce fused with the attention norm-residual boundary."""
 
 from __future__ import annotations
@@ -193,7 +195,7 @@ def all_reduce_norm_residual_supported(
         or not 2 <= comm.world_size <= _MAX_WORLD
         or num_tokens <= 0
         or hidden_size % (comm.world_size * _VEC)
-        or _slot_bytes(num_tokens, hidden_size, comm.world_size) > comm.max_push_size
+        or _slot_bytes(num_tokens, hidden_size, comm.world_size) > comm._max_push_size
     ):
         return False
     if not _supports_clusters():
@@ -202,8 +204,8 @@ def all_reduce_norm_residual_supported(
         cluster_size, _, _ = _launch_config(hidden_size, num_tokens, comm.world_size)
     except RuntimeError:
         return False
-    # Correctness: each block of the cluster kernel needs its own epoch counter; the row kernel
-    # caps its grid at the counter count and loops over rows.
+    # The cluster grid stays within the plane's default launch width (the former counter count);
+    # the row kernel caps its grid there and loops over rows.
     return cluster_size == 1 or num_tokens * cluster_size <= comm.config.num_push_blocks
 
 

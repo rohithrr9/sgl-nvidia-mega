@@ -3,22 +3,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Sources: SGLang python/sglang/kernels/jit/csrc/muse_spark/all_gather_norm_residual.cuh and
-// muse_spark/norm_fp4_quant.cuh at revision 306ccf6.
+// muse_spark/norm_fp4_quant.cuh at revision 306ccf6; the push plane's phase protocol of revision 3117f58 (one
+// EpochCounter phase word per plane instead of per-block counters; the kernel arithmetic is the same there).
 // Modified by NVIDIA: consumer-only forms of two SGLang kernels for a column-sliced projection whose GEMM epilogue has
 // already stored this rank's slice into every rank's copy of the push workspace (the same phase half, slot layout
-// [source rank][M][N / world] and empty-marker rule as SGLang's own all-gather push):
+// [source rank][M][N / world] and empty-marker rule as SGLang's own all-gather push at 306ccf6):
 //   - pub_ag_norm: the FFN boundary of all_gather_norm_residual.cuh (post-norm + gated residual + pre-norm) without its
 //     push of the local slice; the kernel bodies are otherwise SGLang's, line for line;
 //   - pub_norm_fp4_quant: the RMS norm + per-token NVFP4 quantization of norm_fp4_quant.cuh, reading its input row from
 //     the gathered slots instead of a dense tensor, one CTA per row in turn (rows bx, bx + grid, ...), with the
-//     all-gather's phase counters.
+//     all-gather's phase word.
 // Every slot read is bounded (trap after kMaxPolls polls) instead of an unbounded spin; each 16-byte vector is reset to
 // the empty marker after it is taken, as in SGLang's all-gather.
 //
-// Protocol (unchanged from SGLang's all-gather): +0.0 in either 16-bit half of a 32-bit word marks a slot word that
-// has not arrived; producers send an exact +0.0 half as -0.0. A consumer reads its phase from counter[blockIdx.x]
-// after its dependency wait, takes and clears every vector of its rows, and sets counter[blockIdx.x] to the other
-// phase at its end; block 0 also advances the counters of blocks past its grid.
+// Protocol: +0.0 in either 16-bit half of a 32-bit word marks a slot word that has not arrived; producers send an exact
+// +0.0 half as -0.0 (SGLang's all-gather rule at 306ccf6; from 3117f58 SGLang's own all-gather marks per 32-bit word,
+// which a payload remapped per half satisfies too). A consumer reads the phase (EpochCounter::load) after its
+// dependency wait, takes and clears every vector of its rows, and each of its blocks commits the phase word once at
+// its end (EpochCounter::commit, after a block barrier), as every user of the plane does.
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
@@ -36,7 +38,13 @@ namespace sglang {
 namespace muse_vr_pub {
 
 using muse_ag_norm::kVec;
-using muse_ag_norm::vector_pending;
+
+// SGLang's 16-bit-half pending check (muse_ag_norm::vector_pending at 306ccf6, removed in 3117f58 with its per-word
+// Lamport check): the rule the GEMM producer's remap keeps.
+SGL_DEVICE bool vector_pending(uint4 raw) {
+  return (raw.x & 0xffffu) == 0 || (raw.x >> 16) == 0 || (raw.y & 0xffffu) == 0 || (raw.y >> 16) == 0 ||
+         (raw.z & 0xffffu) == 0 || (raw.z >> 16) == 0 || (raw.w & 0xffffu) == 0 || (raw.w >> 16) == 0;
+}
 
 // Upper bound on polls of one slot read. A peer that never delivers (a crashed or diverged rank) then ends the kernel
 // with a trap, which surfaces as a CUDA error, instead of leaving the process spinning.
@@ -118,8 +126,7 @@ SGL_DEVICE void take_block(bf16_t* gathered, uint32_t num_rows, uint32_t row, ui
 
 struct QuantParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
-  device::distributed::Counter* counter;  // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  device::distributed::EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t num_rows;
   const void* weight;     // [K] bf16 effective norm weight, or null
@@ -183,7 +190,7 @@ __global__ void __launch_bounds__(kNumThreads)
   ptx::cluster_arrive_relaxed();
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   PDLTriggerSecondary<kUsePDL>();
 
@@ -317,7 +324,7 @@ __global__ void __launch_bounds__(kNumThreads)
 
   // Every slot this block consumed was reset above; publish the next phase.
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 // C == 1: persistent kernels, each owning rows bx, bx + grid, ... (SGLang's kernel minus its push).
@@ -358,7 +365,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const bool pre_bf16 = norm.pre_norm_bf16;
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   PDLTriggerSecondary<kUsePDL>();
 
@@ -513,7 +520,7 @@ __global__ void __launch_bounds__(kNumThreads)
   }
 
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 // SGLang's muse_spark_norm_fp4_quant_kernel (quantize-only, no normed output), its input row taken from the gathered
@@ -537,12 +544,7 @@ __global__ void __launch_bounds__(kNumThreads)
   __shared__ float smem[kNumWarps == 1 ? 1 : 2 * kNumWarps];
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = params.counter[blockIdx.x].get() & 1;
-  if (blockIdx.x == 0) {
-    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kNumThreads) {
-      params.counter[i].set(phase ^ 1);
-    }
-  }
+  const uint32_t phase = params.counter->load();
   const auto gathered = reinterpret_cast<bf16_t*>(params.ws_local + phase * params.half_bytes);
 
   for (uint32_t row = blockIdx.x; row < params.num_rows; row += gridDim.x) {
@@ -647,7 +649,7 @@ __global__ void __launch_bounds__(kNumThreads)
   PDLTriggerSecondary<kUsePDL>();
   // Every slot this block consumed was reset above; publish the next phase.
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 using host::distributed::CommunicatorRef;
@@ -717,18 +719,13 @@ struct MuseVrPubAgNorm {
         int64_t(num_rows) * kHidden * 2 <= int64_t(push.slot_bytes), "gathered rows exceed the push slot size");
     uint32_t grid = num_rows * kClusterSize;
     if constexpr (kClusterSize == 1) {
-      grid = std::min<uint32_t>(num_rows, push.num_blocks);
-    } else {
-      RuntimeCheck(
-          int64_t(num_rows) * kClusterSize <= int64_t(push.num_blocks),
-          "M * cluster_size exceeds the push plane's block counters");
+      grid = std::min<uint32_t>(num_rows, push.default_blocks);
     }
 
     const auto params = muse_ag_norm::Params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .num_rows = num_rows,
@@ -842,7 +839,6 @@ struct MuseVrPubNormFp4Quant {
     const auto params = muse_vr_pub::QuantParams{
         .ws_local = push.workspaces[push.rank],
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .num_rows = num_rows,
         .weight = weight.has_value() ? weight.value().data_ptr() : nullptr,
@@ -852,7 +848,7 @@ struct MuseVrPubNormFp4Quant {
         .eps = static_cast<float>(eps),
         .global_scale_inv = static_cast<float>(global_scale_inv),
     };
-    const uint32_t grid = std::min<uint32_t>(num_rows, push.num_blocks);
+    const uint32_t grid = std::min<uint32_t>(num_rows, push.default_blocks);
     const auto device = device_.unwrap();
     if (weight.has_value()) {
       LaunchKernel(grid, kNumThreads, device)

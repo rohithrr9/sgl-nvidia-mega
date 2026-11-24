@@ -103,7 +103,7 @@ def supported(
         or num_tokens <= 0
         or num_tokens % comm.world_size
         or slot_bytes_needed(comm.world_size, num_tokens, hidden_size)
-        > comm.max_push_size
+        > comm._max_push_size  # the custom all-reduce's push slot
     ):
         return False
     try:

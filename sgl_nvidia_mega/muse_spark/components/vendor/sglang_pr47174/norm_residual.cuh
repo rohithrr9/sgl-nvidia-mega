@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
-// Copied unchanged from SGLang (Apache-2.0, see ../../include/LICENSE.sglang): python/sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh at SGLang pull request 47174,
+// Copied from SGLang (Apache-2.0, see ../../include/LICENSE.sglang): python/sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh at SGLang pull request 47174,
 // commit e41c694aa247d29fac1d17caf4944ea3eebe8011.
+// Modified by NVIDIA: includes <sgl_kernel/ptx/barrier.cuh> in place of <sgl_kernel/mbarrier.cuh>, as SGLang 3117f58's
+// norm_residual.cuh does (the mbarrier wrappers moved there); nothing else changed.
 /**
  * \brief Fused post-norm + gated residual + pre-norm for the MuseSpark v1.2 layer boundary.
  *
@@ -19,11 +21,12 @@
 
 #include <sgl_kernel/cta.cuh>
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>

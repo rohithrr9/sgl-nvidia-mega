@@ -30,6 +30,8 @@ from __future__ import annotations
 import importlib
 import logging
 
+from . import bed
+
 logger = logging.getLogger("muse_vr_plugin")
 
 MODEL_RELPATH = "sglang/srt/models/muse_spark.py"
@@ -37,9 +39,23 @@ MODEL_RELPATH = "sglang/srt/models/muse_spark.py"
 # the first one with only the two gemm_ag device-class conditions of MuseSpark1xMoE widened (__init__'s workspace reserve
 # and forward's pre-expert projection branch): a stock-path copy that both arms of a comparison may load; no statement any
 # split copies or any component hooks differs.
+# Later revisions pass when the functions the shims copy (MuseSpark1xAttention.forward, MuseSpark1xDecoderLayer.forward)
+# or wrap (the two model forwards) are one of these; the second digests are SGLang 3117f58, where the FFN-boundary
+# all-gather takes the Muse Spark workspace lease (muse_workspace()) instead of the TP custom all-reduce.
 MUSE_SPARK_MAIN: tuple = (
     "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
     "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+    bed.Functions(
+        {
+            "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+            "MuseSpark1xDecoderLayer.forward": ("16062a0b89c4ee50", "51e40503e316c464"),
+            "MuseSpark1xModel.forward": ("82b3cba268aa1fdc", "5a17d5920ad718b9"),
+            "MuseSparkTextForCausalLM.forward": (
+                "e6e491b6b400c513",
+                "72ade900ba1d1069",
+            ),
+        }
+    ),
 )
 
 _installed: list = []
@@ -102,8 +118,14 @@ def _decoder_layer_forward(self, positions, stream, attn_input, forward_batch):
         ffn_output = self.mlp(ffn_input)
     # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
     if ffn_output.shape[-1] != stream.shape[-1]:
+        # the revision's own comm: the Muse Spark workspace lease where the model has one, else the TP custom all-reduce
+        comm = (
+            ms.muse_workspace()
+            if hasattr(ms, "muse_workspace")
+            else ms.get_parallel().tp_group.ca_comm
+        )
         next_attn_input, stream = self._fused_ffn_boundary.forward_with_ag(
-            stream, ffn_output, ms.get_parallel().tp_group.ca_comm
+            stream, ffn_output, comm
         )
         return stream, next_attn_input
     if self._fused_ffn_boundary is None:
@@ -130,12 +152,12 @@ def _split_forward(cls):
 
 def install() -> list:
     """Install the shims once per process on main's layout at a listed revision; returns what was installed."""
-    from . import bed, sgl_compat
+    from . import sgl_compat
 
     if _installed or sgl_compat.layout() != "main":
         return list(_installed)
-    got = bed.file_sha256(MODEL_RELPATH)
-    if not bed.sha_ok(got, MUSE_SPARK_MAIN):
+    if not bed.pinned(MODEL_RELPATH, MUSE_SPARK_MAIN):
+        got = bed.file_sha256(MODEL_RELPATH)
         bed.report(
             "sgl_shims",
             False,

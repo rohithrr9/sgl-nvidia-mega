@@ -142,22 +142,69 @@ PINS = {
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # gated_attention (sgl_shims' split of forward) as the paths re-run it, and the fused KV store they call
+        bed.Functions(
+            {
+                "MuseSpark1xAttention.__init__": "6c44d00fb22adfb0",
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+                "MuseSpark1xAttention._fused_kv_store": (
+                    "a2a4beb31ffa8901",
+                    "4a021cb1e5759e85",
+                ),
+            }
+        ),
     ),
     "sglang/srt/layers/attention/trtllm_mha_backend.py": (
         "566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4",
         "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+        # the stock verify call the paths replace, and the helpers they call
+        bed.Functions(
+            {
+                "TRTLLMHAAttnBackend.forward_extend": (
+                    "9ddde6d7d3f6d4be",
+                    "8e36076dafabff66",
+                ),
+                "TRTLLMHAAttnBackend._run_fixed_q_len_decode": (
+                    "8c6fb1c548557c01",
+                    "48fb6c52d477cf28",
+                ),
+                "TRTLLMHAAttnBackend._forward_extend_uses_native_fp4": "2ca6caa1239a837a",
+                "TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",
+                "TRTLLMHAAttnBackend._get_layer_page_table": (
+                    "2a2d3e0c63990341",
+                    "99e35bc7a9c0d242",
+                ),
+            }
+        ),
     ),
     "sglang/srt/layers/radix_attention.py": (
         "df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e",
         "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0",
+        # its eager-attention divert condition (_stock_diverts_attention)
+        bed.Functions(
+            {"RadixAttention.forward": ("5973e131d911edc8", "4b66858e02f5f39d")}
+        ),
     ),
     "sglang/srt/layers/attention/base_attn_backend.py": (
         "66803e0026f90cdeced7471ca3e28ca1949229f06e6e627450f5a2598f4b1de8",
         "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
+        bed.Functions({"AttentionBackend.forward": "bc5fa8fffe7afd20"}),
     ),
     "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
         "99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67",
         "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25",
+        # the Triton QK-norm call and kernel the prologues reproduce, and its dispatch checks
+        bed.Functions(
+            {
+                "_qk_rms_norm_fwd_kernel": "2ac6993610b2867f",
+                "_triton_config": "fd52a809f56bbf75",
+                "FusedQKNorm.__init__": "83a7af467434ab7b",
+                "FusedQKNorm._store_kv": "b2fe6fbb1f29a23a",
+                "FusedQKNorm.backend_eligible": "e9a45fa9edf2007c",
+                "FusedQKNorm.forward_triton": "a6a635ff3bfb3675",
+                "FusedQKNorm._forward_triton": "835021d2e9d1e932",
+            }
+        ),
     ),
 }
 # Additionally for the fused output norm + gate.
@@ -165,24 +212,54 @@ PINS_NORM_GATE = {
     "sglang/kernels/ops/muse_spark_v12/fused_norm_gate.py": (
         "f127386eafe01455722466c9abf58c8f265c680e90a5e8b8b30175a6b27b44a6",
         "9463859fa6df630123239833d6486c8b8069942ebf127246c49217b44683c662",
+        # the weightless JIT call the fused epilogues reproduce, and its dispatch checks
+        bed.Functions(
+            {
+                "FusedRMSNormGate.__init__": "80e2b58886ad5de9",
+                "FusedRMSNormGate._ensure_cached_weight": "6faa1854bc0627ee",
+                "FusedRMSNormGate.backend_eligible": "52a7485e0bb906ec",
+                "FusedRMSNormGate.forward_jit": "3882ac7689d00543",
+                "FusedRMSNormGate._forward_jit": "6ee543b754b6a72b",
+            }
+        ),
     ),
     "sglang/kernels/ops/muse_spark_v12/norm_gate.py": (
         "376f33a77014dd3f6ed160d3b6a46eb7ef50f3f4bde783bafdbcbaa4fe39aed9",
         "fb66534284d3980d9add7f2417d2b5f7c6e94c5f230c05eba93bf31db72d4815",
     ),
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_gate.cuh": "c2a99a7b37fb810310539010cebea30352b25c1e841b41f8a0fb44aae657bf80",
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_gate.cuh": (
+        "c2a99a7b37fb810310539010cebea30352b25c1e841b41f8a0fb44aae657bf80",
+        # 3117f58 + #48948: sigmoid_gate -> activation::sigmoid (rcp.approx(1 + ex2.approx(-x log2e)), the bits of
+        # __fdividef(1, 1 + __expf(-x)) for every bf16 gate), assume_global loads, kDLGPU; select_config unchanged
+        "31d719a142a65e8c48652c647c941b48c527e49eb4074de89ce18e6fd607c65e",
+    ),
     "sglang/kernels/fused_op.py": (
         "652ceeea3bbbdc2b864c3fa3cf914148d486392a90384506043d5c2ccf60eb3e",
         "749bc702db4102bb6e2620626a906ada67856daa1459bb5141bd1d652168cbd7",
+        # the non-OOT dispatch the "would run SGLang's Triton / JIT kernel" checks mirror
+        bed.Functions(
+            {
+                "_oot_dispatch_key": "11f9b89c3a2e3e90",
+                "get_fused_op_backend": "f8326393db87762d",
+                "BaseFusedOp.forward": "96ca2953bfe4c858",
+                "BaseFusedOp._resolve_forward_method": (
+                    "f459b33e1d4404ed",
+                    "7f5a1991f8131aaf",
+                ),
+                "BaseFusedOp._auto_backend_candidates": "a17b52ea56a20a26",
+                "BaseFusedOp._forward_backend_dynamic": "f67f1ba5eac85928",
+            }
+        ),
     ),
 }
 # The prologue arithmetic reproduces the fused QK-norm Triton kernel as each validated Triton release compiles it
 # (ops/swa_verify_attn.py, QK_ARITH / qk_arith); other releases keep the stock call.
-# flashinfer/decode.py (FlashInfer 0.7.1 and 0.7.2) for full_attn_split: the SM count is read through the
-# module-level name ``get_device_sm_count`` inside ``trtllm_batch_decode_with_kv_cache`` (once, in both releases).
+# flashinfer/decode.py (FlashInfer 0.7.1, 0.7.2 and 0.7.4) for full_attn_split: the SM count is read through the
+# module-level name ``get_device_sm_count`` inside ``trtllm_batch_decode_with_kv_cache`` (once, in each release).
 FLASHINFER_DECODE_SHA256 = (
     "8917d7f1a80707d823455d69d105d90a57e8bb8a71b248348f02d62c547a6f91",  # FlashInfer 0.7.1
     "de1f242bf2f598bc973a9d2f9625f8db1e4ccfc24085f686b2d0304c9076b20d",  # FlashInfer 0.7.2
+    "38fecaeff6eef57b2ea48fb8fe0bc06069970999c2edf34b1487ca0fc35edae3",  # FlashInfer 0.7.4
 )
 
 TOKENS = 8

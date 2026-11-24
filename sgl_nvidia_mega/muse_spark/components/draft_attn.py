@@ -31,7 +31,7 @@ draft-numerics class, error against fp64 checked by tests/test_draft_attn.py lik
 ``MUSE_VR_DRAFT_ATTN_SHADOW=1`` (debug) also runs the stock call for every eager fused call and tallies whether the two
 agree within the summation-order tolerance (bed.shadow_result).
 
-Engaged (an AROUND hook on the FlashAttention backend module's ``flash_attn_with_kvcache``) only for: FA4, bf16, head
+Engaged (an AROUND hook on the FlashAttention backend's ``flash_attn_with_kvcache`` method) only for: FA4, bf16, head
 dim 128, 8 query heads per KV head, 8 query tokens per request (``max_seqlen_q == 8`` and 8 x requests rows), no causal
 mask, no soft cap / sinks / score modifiers / descales / rotary / new keys / LSE output, at most
 ``MUSE_VR_DRAFT_ATTN_MAX_REQS`` requests (default 4; tunable, tests/test_draft_attn.py --bench). Every other call runs
@@ -41,6 +41,7 @@ that finds it unloaded keeps the stock path.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -56,25 +57,44 @@ SGLANG_READS = {
 logger = logging.getLogger(__name__)
 
 NAME = "draft_attn"  # env MUSE_VR_DRAFT_ATTN
-TARGET = "sglang.srt.layers.attention.flashattention_backend.flash_attn_with_kvcache"
+TARGET = "sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend.flash_attn_with_kvcache"
 Q_TOKENS = 8
 
 PINS = {
+    # the backend's flash_attn_with_kvcache method (the hook target) exists from SGLang 3117f58 + #48948 on; older
+    # revisions called a module-level function, so their sha256 entries are gone
     "sglang/srt/layers/attention/flashattention_backend.py": (
-        "53489175aace7b97498efb10ae8b01c489d35e91058842eee02b19aec18f1a3c",
-        "a7b8d205742765e12bf0bad48b151007258736e31f6c97a03725cac6ca2c1d17",
+        bed.Functions(
+            {
+                "FlashAttentionBackend.flash_attn_with_kvcache": "3a7825ad377dee04",
+                "FlashAttentionBackend._init_flash_attention_functions": "a87b0ddbf2f9d58c",
+                "_load_fa4_kernels": "42ce5c3180b59a49",
+                "FlashAttentionBackend.forward_extend": "6ef18b40dc548054",
+            }
+        ),
     ),
     "sglang/kernels/ops/attention/flash_attention.py": (
         "9f03405f95d100b1989c7041b4dd27298374bb8b8fe152f16949dd0e73ad22bc",
         "294a491df03ca57166044107299c66f0e7c3f4163986725a68709417c31eb981",
+        # the backend no longer calls this dispatcher: it calls flash_attention_v4's kernel entry (pinned below)
+        bed.Functions({}),
     ),
     "sglang/kernels/ops/attention/flash_attention_v4.py": (
         "7518bff1277105d4b8c26d1e22d72c051fd3a6423fd72800ac5fbe08da1bd70b",
         "ee34fddd7e9080268ea1e3ee8f11f32f0674b5d7eda3ff15c6f188de70dc6c01",
+        bed.Functions(
+            {"flash_attn_with_kvcache": ("73ab230f312cf778", "5acd5d833ff2e3c7")}
+        ),
     ),
     "sglang/srt/models/dflash.py": (
         "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
         "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "DFlashAttention.forward": ("2f24bd88941e8860", "2dfac1ad36d1f89d"),
+                "DFlashAttention.__init__": ("00710456bf5598ff", "1367b0c7ae6ff9ca"),
+            }
+        ),
     ),
 }
 
@@ -274,6 +294,11 @@ def attention(original, *args, **kwargs):
     return out
 
 
+def attention_method(original, backend, *args, **kwargs):
+    """The hook on the backend method: ``attention`` with the backend bound to the stock method."""
+    return attention(functools.partial(original, backend), *args, **kwargs)
+
+
 def register() -> bool:
     if not enabled():
         return False
@@ -283,6 +308,6 @@ def register() -> bool:
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    HookRegistry.register(TARGET, attention, HookType.AROUND)
+    HookRegistry.register(TARGET, attention_method, HookType.AROUND)
     bed.report(NAME, True)
     return True

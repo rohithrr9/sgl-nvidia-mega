@@ -10,8 +10,9 @@ the same rows (block positions below each request's commit length) to the same s
 bf16 rows (tests/test_draft_kv_append.py).
 
 Engaged only for the prefix-valid path (``ctx_cache_loc_2d`` and ``commit_lens`` given), a plain ``MHATokenToKVPool``
-draft pool (or ``kv_draftwin``'s sliding-window draft pool: its sliding-window sub-pool, written at the slots its
-full->SWA mapping names) whose cache and store dtype equal the rows' dtype (bf16, no quantization), equal K/V row widths, and per-layer
+draft pool (or ``kv_draftwin``'s sliding-window draft pool: its sliding-window sub-pool, written at the window ids the
+writer passes, ``ctx_swa_cache_loc`` on the newer SGLang, else at the slots its full->SWA mapping names) whose cache and
+store dtype equal the rows' dtype (bf16, no quantization), equal K/V row widths, and per-layer
 rows that come from one workspace at a constant layer stride. Everything else runs stock. Eager only (this region is not
 graph-captured).
 """
@@ -50,12 +51,45 @@ PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        # The hooked writer. The newer one writes through the pool's layer router, which for a plain pool is the
+        # same set_kv_buffer_prefix_valid call, and also takes the window ids (ctx_swa_cache_loc).
+        bed.Functions(
+            {
+                "DFlashWorkerV2._append_target_hidden_fused": (
+                    "c40ffaf1f6f3074f",
+                    "d3353a4a8205b48e",
+                )
+            }
+        ),
     ),
     "sglang/srt/mem_cache/memory_pool.py": (
         "b439441448d1112952876cd5f814ea47fcd561ece1a9aa0e7d2080d5f4874106",
         "f3e12b293f3bdce21604ca5e5b473c07dcb6c8e4a34b582c4498d0bd45a10900",
+        # The prefix-valid write the kernel replaces (bf16 rows: plain copies) and that the fallback calls.
+        bed.Functions(
+            {
+                "MHATokenToKVPool.set_kv_buffer_prefix_valid": (
+                    "ed389fc54eab86ff",
+                    "01df6269dfafbb3b",
+                ),
+                "_set_mha_kv_buffer_prefix_valid": "0a53bfe8168c95f4",
+                "_set_kv_buffer_prefix_valid_impl": "584bfc3c6cbecf35",
+            }
+        ),
     ),
-    "sglang/kernels/ops/speculative/fused_kv_materialize.py": "b8dd985b7764d3212e9e3045b2daa5be0c481215346ab28f2513f8201e9cbfeb",
+    "sglang/kernels/ops/speculative/fused_kv_materialize.py": (
+        "b8dd985b7764d3212e9e3045b2daa5be0c481215346ab28f2513f8201e9cbfeb",
+        # Rows handed to write_layer_kv in layer order from one workspace; the newer projection multiplies by the
+        # weight's transposed view instead of a transposed copy.
+        bed.Functions(
+            {
+                "FusedKVMaterializeHelper.materialize": (
+                    "ef373ab24550022e",
+                    "6ff3c927067b5a1c",
+                )
+            }
+        ),
+    ),
 }
 
 _tables: dict = {}
@@ -197,7 +231,12 @@ def append_fused(original, worker, *args, **kw):
             pool.layers_mapping[layers[i].self_attn.attn.layer_id][0]
             for i, _, _ in rows
         ]
-        write_loc = pool.kvdw_to_swa(loc_2d)
+        # the newer writer passes the window ids it writes at (ctx_swa_cache_loc); without them, translate
+        swa_loc = kw.get("ctx_swa_cache_loc")
+        if swa_loc is None:
+            write_loc = pool.kvdw_to_swa(loc_2d)
+        else:
+            write_loc = swa_loc.view_as(loc_2d).to(torch.int64).contiguous()
     else:
         ids = [layers[i].self_attn.attn.layer_id - pool.start_layer for i, _, _ in rows]
         write_loc = loc_2d

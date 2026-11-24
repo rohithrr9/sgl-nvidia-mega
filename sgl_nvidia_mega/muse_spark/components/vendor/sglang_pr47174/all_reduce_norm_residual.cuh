@@ -6,6 +6,9 @@
 // Modified by NVIDIA: the slot poll is bounded (MUSE_VR_K47_MAX_POLLS unsuccessful polls, default 2^27, set by the
 // caller at build time); at the bound one thread prints one diagnostic line and traps, so a peer that never delivers
 // ends in a CUDA error instead of a hang. Loads, stores, their order and every value are unchanged.
+// Modified by NVIDIA: ported to SGLang 3117f58's push plane (communicator.cuh): the epoch parity is the plane's
+// EpochCounter phase word, read after the PDL wait and committed once per block, instead of per-block counters that
+// block 0 advanced; launch widths read the plane's default_blocks (the former counter count). Values unchanged.
 // Fused bf16 push all-reduce + post-norm + gated residual + pre-norm (MuseSpark attention boundary).
 // All-reduces the o_proj partial with 1-shot or 2-shot push on the CustomAllReduceV2 plane and feeds the reduced row
 // to the row functions of norm_residual.cuh; outputs are bitwise those of 1shot_push / 2shot_push + the norm kernel.
@@ -27,7 +30,6 @@ namespace muse_ar_norm {
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;
   uint32_t rank;
   uint32_t num_rows;
   const bf16_t* partial;
@@ -80,8 +82,8 @@ SGL_DEVICE void poll_all(BF16Vec (&v)[N], void* const (&slots)[N], const int64_t
   } while (pending);
 }
 
-/// The plane's global epoch parity: every counter holds the same value; a block reads and flips its own, and block 0
-/// advances the counters of blocks this grid does not launch.
+/// The plane's global epoch parity: the plane's phase word (EpochCounter), read after the PDL wait; every block commits
+/// it once when done.
 template <uint32_t kWorld>
 struct Epoch {
   uint8_t* const* workspaces;
@@ -91,7 +93,7 @@ struct Epoch {
   SGL_DEVICE Epoch(const device::distributed::PushWorkSpace<kWorld>& ws, uint32_t rank)
       : workspaces(ws.workspaces.data()),
         slot_bytes(ws.slot_bytes),
-        value(ws.counter[blockIdx.x].get()),
+        value(ws.counter->load()),
         inbox(ws.workspaces[rank] + (value & 1) * kWorld * slot_bytes) {}
   SGL_DEVICE uint32_t slot_offset(uint32_t src) const {
     return (src + (value & 1) * kWorld) * slot_bytes;
@@ -262,16 +264,13 @@ struct Exchange {
 
   SGL_DEVICE void finish() const {
     __syncthreads();
-    if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(epoch.value ^ 1);
-    if (blockIdx.x == 0)
-      for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += blockDim.x)
-        params.ws.counter[i].set(epoch.value ^ 1);
+    if (threadIdx.x == 0) params.ws.counter->commit();
   }
 };
 
 }  // namespace muse_ar_norm
 
-// C = 1: rows strided over the grid (bound to the plane's block counters), each through norm_residual_row.
+// C = 1: rows strided over the grid (bound to the plane's default launch width), each through norm_residual_row.
 template <
     int64_t kHidden,
     uint32_t kWorld,
@@ -289,7 +288,7 @@ __global__ void __launch_bounds__(kNumThreads)
   using Ex = muse_ar_norm::Exchange<kHidden, kWorld, kNumThreads, 1, kTwoShot, kMulticast>;
   // Wait for the o_proj GEMM that writes `partial`.
   device::PDLWaitPrimary<kUsePDL>();
-  // Read this block's epoch parity: which half of the double-buffered slots this launch uses.
+  // Read the plane's epoch parity: which half of the double-buffered slots this launch uses.
   const Ex ex{params, muse_ar_norm::Epoch<kWorld>{params.ws, params.rank}, 0};
   // Phase 1: push every row this block owns to its peers.
   for (uint32_t row = blockIdx.x; row < params.num_rows; row += gridDim.x)
@@ -316,7 +315,7 @@ __global__ void __launch_bounds__(kNumThreads)
         kPostWeight,
         kGate>(params.norm, row, [&branch](int pack, int) { return branch[pack]; });
   }
-  // Flip the epoch parity for the next launch on the plane.
+  // Commit this block's share of the plane's phase advance for the next launch.
   ex.finish();
 }
 
@@ -341,7 +340,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const uint32_t row = blockIdx.x / kClusterSize;
   // Wait for the o_proj GEMM that writes `partial`.
   device::PDLWaitPrimary<kUsePDL>();
-  // Read this block's epoch parity: which half of the double-buffered slots this launch uses.
+  // Read the plane's epoch parity: which half of the double-buffered slots this launch uses.
   const Ex ex{params, muse_ar_norm::Epoch<kWorld>{params.ws, params.rank}, cluster_rank};
   // Phase 1: push this block's part of the row to its peers.
   ex.push(row);
@@ -365,7 +364,7 @@ __global__ void __launch_bounds__(kNumThreads)
       kHasRouter,
       kPostWeight,
       kGate>(params.norm, row, [&branch](int pack, int) { return branch[pack]; });
-  // Flip the epoch parity for the next launch on the plane.
+  // Commit this block's share of the plane's phase advance for the next launch.
   ex.finish();
 }
 
@@ -431,7 +430,6 @@ struct MuseSparkAllReduceNormResidual {
 
     const auto params = muse_ar_norm::Params<kWorld>{
         .ws = push.get_workspace<kWorld>(slot),
-        .num_counters = push.num_blocks,
         .rank = push.rank,
         .num_rows = num_rows,
         .partial = static_cast<const bf16_t*>(partial.data_ptr()),
@@ -478,7 +476,7 @@ struct MuseSparkAllReduceNormResidual {
           RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
           return uint32_t(per_sm * sms);
         }();
-        LaunchKernel(std::min({num_rows, max_blocks, push.num_blocks}), kNumThreads, device)
+        LaunchKernel(std::min({num_rows, max_blocks, push.default_blocks}), kNumThreads, device)
             .config({.use_pdl = kUsePDL})(kernel, params);
       } else {
         constexpr auto kernel = muse_spark_all_reduce_norm_residual_cluster_kernel<
@@ -513,7 +511,8 @@ struct MuseSparkAllReduceNormResidual {
         }();
         RuntimeCheck(
             int(num_rows) <= max_clusters, "rows exceed co-resident clusters: ", num_rows, " > ", max_clusters);
-        RuntimeCheck(num_rows * kClusterSize <= push.num_blocks, "M * cluster_size exceeds the plane's block counters");
+        RuntimeCheck(
+            num_rows * kClusterSize <= push.default_blocks, "M * cluster_size exceeds the plane's default launch width");
         LaunchKernel(num_rows * kClusterSize, kNumThreads, device)
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kClusterSize, 1, 1)})(kernel, params);
       }

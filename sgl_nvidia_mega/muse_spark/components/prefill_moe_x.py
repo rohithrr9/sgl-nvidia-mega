@@ -77,27 +77,72 @@ SGLANG_PINS = {
     "sglang/srt/layers/muse_spark_fp4_moe.py": (
         "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
         "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+        bed.Functions(
+            {
+                "MuseSpark1xFp4Experts.forward": "b0123c5c8460b210",
+                "MuseSpark1xFp4Experts.forward_dispatched": "55ee763b2d00ed84",
+                "MuseSpark1xFp4Experts._finalize_deferred_output": "243e920761c83e15",
+                "finalize_with_post_expert_norm": "a3ee37c3b9b8b7cf",
+            }
+        ),
     ),
     # eager-pass guard: the prefill CUDA-graph runner's capture-session flag (set / cleared around warm-ups and captures)
     "sglang/srt/runtime_context.py": (
         "b8510f48bb90fa22474a64f6769c1e71e3fb47a95dd313cffb11df7bf414c975",
         "17c498293ca672c39fea298fa104d5b5603323581cb18d695e5d8fc4f06d1bc6",
+        # the flag's field is written by the runner's pinned _capture (typo-safe flag groups)
+        bed.Functions({"get_flags": "5d855568355fb5de"}),
     ),
     "sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": (
         "72a372b5243e8d21ef943fa4f1348419c8c4413a522c0e6be662d6d5b0fb505c",
         "1ce58cd316c4e07ab4e9044f031833ef82777ea0bf1263ffd3d962e3f32eb770",
+        bed.Functions(
+            {
+                "PrefillCudaGraphRunner.capture": (
+                    "3920f9e0b03a7125",
+                    "c370bdc3777fabd7",
+                ),
+                "PrefillCudaGraphRunner._capture": "0f98a5de8e548f00",
+                "PrefillCudaGraphRunner._capture_one_stream": "6dd7262b6f2cfb86",
+                "PrefillCudaGraphRunner.capture_one_shape": (
+                    "8490d73a732ebac4",
+                    "2dff25da9ed6e93f",
+                ),
+            }
+        ),
     ),
     # sequence-parallel prefill expert call
     "sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
         "2f6f14ae1d95030db1ec249856b331f4e6880b0218727e8701c3944376acaaf9",
         "70db650773c0dcbeec8056d70ad6f6a0c06acd5d583e9bbbe8f4d5548cf25929",
+        bed.Functions(
+            {
+                "fused_experts_none_to_flashinfer_trtllm_fp4": (
+                    "0dfa54f6aadafdb9",
+                    "2a1f4fc4d88cc17f",
+                ),
+                "flashinfer_trtllm_deferred_finalize_context": "1efbe8d227930367",
+                "_make_deferred_finalize_output": (
+                    "66b82cd94c8bf022",
+                    "612b8e881064d817",
+                ),
+            }
+        ),
     ),
     # expert weight preparation (gate / up order, row shuffle, block-scale interleave, global scales)
     "sglang/srt/layers/quantization/muse_spark_nvfp4_moe.py": (
         "c09e0b4e32b7d5ac7af30caf74121dc0897e14e44f0e4503ea33a7acaf8f35a0",
         "6a1769ef903f1771040fc97e78c3fa46662ab0311cb45a5455984562da2c8a5d",
     ),
-    "sglang/srt/layers/quantization/utils.py": "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+    "sglang/srt/layers/quantization/utils.py": (
+        "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+        bed.Functions(
+            {
+                "prepare_static_weights_for_trtllm_fp4_moe": "75f83963666d5816",
+                "reorder_w1w3_to_w3w1": "735b0b9f1dac75f1",
+            }
+        ),
+    ),
 }
 # sha256 of files relative to the directory that holds the ``flashinfer`` package.
 FLASHINFER_PINS = {
@@ -105,25 +150,38 @@ FLASHINFER_PINS = {
     "flashinfer/fused_moe/core.py": (
         "d6a8333a2749e45e17f4ad6443c3ca84fcc8b15bca4d32adecc6cd0373528b17",  # FlashInfer 0.7.1
         "b25655f5cdc031ed003a53f92927d912154a6d4f8b37c92a52b19ae2e2da0d79",  # FlashInfer 0.7.2
+        "c1170d4734cd1474ce2e50de8af35aa393164b00c3ae1ac1265b9644835465e8",  # FlashInfer 0.7.4
     ),
-    "flashinfer/data/csrc/trtllm_fused_moe_runner.cu": "f155765b0062a5d8a2395d4c654d10b2a56075abdf0aefd26a6f4274c56867c4",
+    "flashinfer/data/csrc/trtllm_fused_moe_runner.cu": (
+        "f155765b0062a5d8a2395d4c654d10b2a56075abdf0aefd26a6f4274c56867c4",  # FlashInfer 0.7.1, 0.7.2
+        "21645f78ce1a34095931ee781e89fb6a5c6b8da2a552739a94e07e8ac44b7253",  # FlashInfer 0.7.4
+    ),
     # weight row shuffle used by the preparation
     "flashinfer/utils.py": (
         "7f7da22cf3b312590ac260e39d551772d61959746f998a5650c39804c876291a",  # FlashInfer 0.7.1
         "abc97f7494cecc485395aeecd87d15e05ea518cf3d6ab1cc8c7e96fcdec3ad4d",  # FlashInfer 0.7.2
+        "84a5963f7a2fd0b56fe9c7653165f9764f692090253553e31f099be41f2169fb",  # FlashInfer 0.7.4
     ),
     # per-token NVFP4 quantizer (binding and kernel)
     "flashinfer/quantization/fp4_quantization.py": (
         "c3fa702c5637267d941e5c0be10c3d89272bc13e1a59a6af0f5f0e593366665a",  # FlashInfer 0.7.1
         "50221b0ebc1b76ec896c78e6fe368177a717953f5cb6d2643db108dc5fa91003",  # FlashInfer 0.7.2
+        "d39602926b0be67a6acdc413655ca575c7d745b04bc60eb855df3580e053c1f6",  # FlashInfer 0.7.4
     ),
     "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/quantization.cuh": (
         "65be729913825a828fde20462cea9d687fef02537bdf07add790f9cccc297b61",  # FlashInfer 0.7.1
         "2943cb8a066ff7dd329a6f7793ac1012eebc766e7942e4d46eb7a38b5ac9c0c6",
+        "80bb8f24ae1c4d0f70204c744cafb5d7eb96dbcff47559ce8b177e6074ee03be",  # FlashInfer 0.7.4
     ),  # FlashInfer 0.7.2
     # moe_sort and the scale-layout / pointer helpers
-    "flashinfer/fused_moe/cute_dsl/moe_utils.py": "d2f603e086876d7fa7256e95df3b8ba802ba174bc68efaccbd2785068815eee1",
-    "flashinfer/cute_dsl/utils.py": "971faf2b712c8d973cf7b81fdb97b12d04d0fb9ff350c314981c1049b3816a25",
+    "flashinfer/fused_moe/cute_dsl/moe_utils.py": (
+        "d2f603e086876d7fa7256e95df3b8ba802ba174bc68efaccbd2785068815eee1",  # FlashInfer 0.7.2
+        "86b72721f224a52822e3d60a11e14b0d954fc5ccf8dc93107c397636cdbefa62",  # FlashInfer 0.7.4
+    ),
+    "flashinfer/cute_dsl/utils.py": (
+        "971faf2b712c8d973cf7b81fdb97b12d04d0fb9ff350c314981c1049b3816a25",  # FlashInfer 0.7.1, 0.7.2
+        "df35130f8c8c867a440d7ff3392ac23b19c8628429a7b65177c80bd0410c75cf",  # FlashInfer 0.7.4
+    ),
 }
 
 HIDDEN = 4096
@@ -236,6 +294,21 @@ def _is_f32_vec(t, n) -> bool:
     )
 
 
+def _autotune_key_output(kw: dict) -> bool:
+    """True for the ``[tokens, HIDDEN]`` bf16 ``output`` newer SGLang passes with ``do_finalize=False`` only to key
+    FlashInfer's autotuner (flashinfer-ai/flashinfer#6077): without finalize the stock op does not write it, and the
+    deferred outputs returned here do not use it either."""
+    out, hs = kw["output"], kw.get("hidden_states")
+    return (
+        kw.get("do_finalize", True) is False
+        and torch.is_tensor(out)
+        and torch.is_tensor(hs)
+        and hs.dim() == 2
+        and out.dtype == torch.bfloat16
+        and tuple(out.shape) == (hs.shape[0], HIDDEN)
+    )
+
+
 def _eligible(kw: dict) -> str:
     """'' when the call can run on this path, else the step-aside reason."""
     if kw.get("do_finalize", True) is not False:
@@ -249,14 +322,21 @@ def _eligible(kw: dict) -> str:
         "gemm1_bias",
         "gemm2_bias",
         "routing_bias",
+        # FlashInfer 0.7.4: caller-owned scratch (needs do_finalize=True) and pre-built routing
+        "workspace_buffer",
+        "routing_metadata",
     ):
         if kw.get(k) is not None:
             return k
+    if (
+        "nvfp4_4over6" in kw
+    ):  # FlashInfer 0.7.4: an explicit recipe (None too: the environment is then ignored)
+        return "nvfp4_4over6"
     if kw.get("routed_scaling_factor") not in (None, 1.0):
         return "routed_scaling_factor"
     if kw.get("n_group") not in (None, 0) or kw.get("topk_group") not in (None, 0):
         return "group_routing"
-    if "output" in kw and kw["output"] is not None:
+    if "output" in kw and kw["output"] is not None and not _autotune_key_output(kw):
         return "output"
     hs = kw.get("hidden_states")
     sf = kw.get("hidden_states_scale")

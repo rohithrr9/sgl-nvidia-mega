@@ -47,6 +47,21 @@ PINS = {
     "sglang/srt/layers/muse_spark_bf16_moe.py": (
         "687680077a7542cb1e2026d321c2f18a650fb56a654b50434acbf7be9c1aa6c5",
         "57ae1593b4496edfc658343d9ca039dead111484d78ec57ab3eaa14891f6afed",
+        # the hooked preparation and expert call, the BlockMajorK shuffle the relay placement takes, and the TRT-LLM
+        # path selection (3117f58 + #48948: __init__ only adds the runner backend to its MoeRunnerConfig; and 306ccf6)
+        bed.Functions(
+            {
+                "MuseSpark1xBf16Experts.__init__": (
+                    "5948cef23046472c",
+                    "c1ca439fb5f5fd3b",
+                ),
+                "MuseSpark1xBf16Experts.prepare_trtllm_weights": "19549113a95c844e",
+                "MuseSpark1xBf16Experts._shuffle_weights": "741254c118281586",
+                "MuseSpark1xBf16Experts.forward": "a75b25d7d541dcaa",
+                "MuseSpark1xBf16Experts._forward_trtllm": "b5a7292f864e7351",
+                "_trtllm_bf16_moe_supported": "36e0306b9d21c4f1",
+            }
+        ),
     ),
 }
 _RING = ("-DMUSE_VR_LDW_PASS_ROWS=32", "-DMUSE_VR_LDW_STAGES=5")

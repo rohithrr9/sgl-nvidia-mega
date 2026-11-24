@@ -118,21 +118,117 @@ NAME = "fp8_prefill"
 GROUPS_ALL = ("qkv", "o", "pool", "unpool")
 DEFAULT_MIN_TOKENS = 1280
 SGLANG_PINS = {
-    "sglang/srt/layers/layernorm_sp.py": "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
-    "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+    "sglang/srt/layers/layernorm_sp.py": (
+        "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        # the SP entry points it hooks (CUDA paths unchanged; NPU branches added) and the token count it reads
+        bed.Functions(
+            {
+                "column_parallel_g_matmul": ("05b641b21a3de750", "94ee75afa2851241"),
+                "row_parallel_gbar_matmul": ("eb12fef27a69d7a4", "8bfbed80df1b9e08"),
+                "sp_num_tokens": "3607395533622768",
+                "set_sp_num_tokens": "cc31e348625a4b14",
+                "sp_entry_scatter": ("0816745cf77a5a21", "5bf03d3be31403ec"),
+                "sp_fused_matmul_eligible": ("80b7b55058189c04", "2d00f57adf7f8037"),
+            }
+        ),
+    ),
+    "sglang/srt/layers/linear.py": (
+        "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+        # the SP dispatch of the qkv / o_proj forwards
+        bed.Functions(
+            {
+                "ColumnParallelLinear.forward": "7538aefbf1cabf51",
+                "RowParallelLinear.forward": ("1d5fb1eabbb87ec4", "b291a3c452e428a5"),
+            }
+        ),
+    ),
     "sglang/srt/models/muse_spark.py": (
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # the hooked forward, the projections' participants and call sites, the boundaries feeding them
+        bed.Functions(
+            {
+                "MuseSpark1xModel.__init__": ("494fbc30068c6846", "078c27dc5123bc97"),
+                "MuseSpark1xModel.forward": ("5a17d5920ad718b9", "82b3cba268aa1fdc"),
+                "_fused_norm_boundary": "5ccfd2ae5d86e727",
+                "MuseSpark1xDecoderLayer.__init__": "e8d853ff24c4ff47",
+                "MuseSpark1xDecoderLayer.bind_next_pre_attn_norm": "8d3834e239661cfb",
+                "MuseSpark1xDecoderLayer.forward": (
+                    "51e40503e316c464",
+                    "16062a0b89c4ee50",
+                ),
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+                "MuseSpark1xMoE.__init__": ("38b36b568c633d3e", "d6bfb1206d665b81"),
+                "MuseSpark1xMoE.forward": "72a174aadac5ceae",
+                "MuseSpark1xMoE._forward_tp": "1c1aa0fe77681cd0",
+                "MuseSpark1xMoE._forward_experts": (
+                    "04c56c86a0d682b6",
+                    "b80c7971fd8b3bfc",
+                ),
+                "MuseSpark1xMoE._reduce_and_unpool": (
+                    "84d2840940f3c49b",
+                    "8c38fcfb0523752b",
+                ),
+            }
+        ),
     ),
-    "sglang/srt/layers/quantization/unquant.py": "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
-    "sglang/kernels/ops/communication/sp_collective_gemm.py": "f1cc99967104416a31fe7c99a710a9ccf8024ac1579c08579f11ac68a476a836",
+    "sglang/srt/layers/quantization/unquant.py": (
+        "7285d3e9e9fa881c5ecd97d093a8f59e11e69f26d5e3e7006925149f624a2f9c",
+        # the hooked BF16 dispatch and the entry the pool / unpool calls reach it through
+        bed.Functions(
+            {
+                "_bf16_gemm_dispatch_impl": ("7f678770cd557687", "a9d060061e2076e2"),
+                "bf16_gemm_dispatch": "a774516d6d09eec9",
+            }
+        ),
+    ),
+    "sglang/kernels/ops/communication/sp_collective_gemm.py": (
+        "f1cc99967104416a31fe7c99a710a9ccf8024ac1579c08579f11ac68a476a836",
+        # the all-gather + GEMM the qkv call replaces (row layout of its result) and the pull ordering it mirrors
+        bed.Functions(
+            {
+                "all_gather_matmul": "0b9264fbb864e38f",
+                "_all_gather_matmul_cublas": "225a7f48ac42cf29",
+                "_pad_shards": "7577a862cfa66e50",
+                "_unpad_shards": "90b021d8c7eaf261",
+            }
+        ),
+    ),
 }
 
 # the fused producers (MUSE_VR_FP8_PREFILL_B3) mirror SGLang's boundary op, its launch policy and its kernel
 B3_PINS = {
-    "sglang/kernels/ops/layernorm/muse_spark_norm_residual.py": "454f084d20e5f2353a70d260ea4a70c7dfdff3bf45a58619ef72e1eec2646fe3",
-    "sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py": "76bd0c26ed4d3cf87126619c72a56de908dea0ea1b2c69f6e5ada47318035cbe",
-    "sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh": "c227348c4d705183d377ac623a62b1ed6957eb8832fb0508f4ac99f1aa3cb0c8",
+    "sglang/kernels/ops/layernorm/muse_spark_norm_residual.py": (
+        "454f084d20e5f2353a70d260ea4a70c7dfdff3bf45a58619ef72e1eec2646fe3",
+        bed.Functions(
+            {
+                "FusedPostNormResidualPreNorm.forward_jit": "3878afc5a00035cb",
+                "FusedPostNormResidualPreNorm._triton_supported": "f6c23ac420a1de48",
+                "FusedPostNormResidualPreNorm.jit_kernel_kwargs": "f3ddcac4283845af",
+                "FusedPostNormResidualPreNorm._ensure_cached_weights": "5ec64f255028acea",
+            }
+        ),
+    ),
+    "sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py": (
+        "76bd0c26ed4d3cf87126619c72a56de908dea0ea1b2c69f6e5ada47318035cbe",
+        bed.Functions(
+            {
+                "fused_norm_residual": ("975cd488a7dc2b2a", "2c23bbac7ad02b49"),
+                "norm_residual_launch_config": "f17e9aca194a4569",
+                "_cluster_launch_config": "c452484293b41a96",
+                "_launch_config": "6e723da04f97ee09",
+                "_cluster_size_for_shape": "86fe115c0cf73957",
+                "cluster_size_for_num_tokens": "7aaad493de86a8cd",
+                "_cluster_num_threads": "41338200a597223f",
+                "_jit_module": "d30468ed58da1034",
+            }
+        ),
+    ),
+    "sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh": (
+        "c227348c4d705183d377ac623a62b1ed6957eb8832fb0508f4ac99f1aa3cb0c8",
+        # a later revision whose only change is an include (mbarrier.cuh -> ptx/barrier.cuh); the kernel is the same
+        "1bced24bcdc40d2cadb3ef6120d1adbfeaa5b3900eb9d3c91beebac020b42f4b",
+    ),
 }
 B3_POSITIONS = ("U", "A")
 

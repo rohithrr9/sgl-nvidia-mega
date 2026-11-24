@@ -7,6 +7,8 @@
 // Modified by NVIDIA: one kernel performs, for a DFlash draft layer boundary, the one-shot push all-reduce of the
 // row-parallel bf16 partials, the output side of the grouped two-tap block convolution, the residual add and the
 // RMSNorm of the next sublayer.
+// Ported to SGLang 3117f58's push plane (communicator.cuh): one EpochCounter phase word shared by every kernel on the
+// plane, read after the PDL wait and committed once per block, in place of the per-block phase counters.
 //
 // Layout: M = R * kBlock rows (R requests, kBlock tokens per request block), H = kHidden columns.
 //   partial:  [M, H] bf16, this rank's row-parallel partial
@@ -26,7 +28,7 @@
 // a different summation order than the stock norm kernel (reduction order only).
 //
 // Work split: one thread-block cluster of kCluster CTAs per request block (a cluster loops over several request blocks
-// when the grid is capped by the push plane's block counters); CTA c handles columns
+// when the grid is capped by the push plane's default launch width); CTA c handles columns
 // [c * H / kCluster, (c + 1) * H / kCluster) of the block's kBlock rows, so a token's predecessor row is in the same
 // CTA. The CTA that pushes a vector is the CTA that consumes it on every rank. Row sums of squares are exchanged
 // through distributed shared memory after a cluster barrier (arrive.release / wait.acquire).
@@ -35,8 +37,8 @@
 // the other). Same values, same arithmetic; the outputs are bit-identical (tests/dist_draft_boundary.py).
 //
 // kConsumerOnly: this rank's vectors were already pushed to the peers by the GEMV that produced the partial
-// (draft_gemv_push.cuh); the kernel polls, sums, clears and flips the counters as usual but does not push. Same slots, same
-// values: bit-identical outputs.
+// (draft_gemv_push.cuh); the kernel polls, sums, clears and commits the phase word as usual but does not push. Same slots,
+// same values: bit-identical outputs.
 //
 // kEarlyTrigger: the dependent launch is signalled right after this grid's own dependency wait instead of at its end, so a
 // following kernel launched with programmatic stream serialization can run its independent prologue (for example its
@@ -76,7 +78,6 @@ __device__ __noinline__ void poll_bound_exceeded() {
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;
   uint32_t rank;
   uint32_t num_requests;
   const uint4* partial;      // [M, H] bf16 as 16-byte vectors
@@ -227,17 +228,11 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   device::PDLWaitPrimary<kUsePDL>();
   if constexpr (kEarlyTrigger) device::PDLTriggerSecondary<kUsePDL>();
 
+  // the plane's phase word, read after the PDL wait (EpochCounter::load)
   uint32_t phase = 0;
-  if constexpr (!kLoopback) {
-    phase = params.ws.counter[blockIdx.x].get() & 1;
-    if (blockIdx.x == 0) {
-      for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kThreads) {
-        params.ws.counter[i].set(phase ^ 1);
-      }
-    }
-  }
+  if constexpr (!kLoopback) phase = params.ws.counter->load();
 
-  // request blocks of this cluster (several when the grid is capped by the plane's block counters)
+  // request blocks of this cluster (several when the grid is capped by the plane's default launch width)
   for (uint32_t req = blockIdx.x / kCluster; req < params.num_requests; req += gridDim.x / kCluster) {
   const uint32_t row = req * kBlock + t;
   // later request blocks: this CTA's reads of the previous `part` are ordered before the peers' next stores into it
@@ -439,8 +434,9 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   }
   device::PDLTriggerSecondary<kUsePDL>();
   if constexpr (!kLoopback) {
+    // every thread of the block has read the phase: the block commits once (EpochCounter::commit)
     __syncthreads();
-    if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(phase ^ 1);
+    if (threadIdx.x == 0) params.ws.counter->commit();
   }
 }
 
@@ -488,12 +484,7 @@ __global__ __launch_bounds__((kBlock / kSplit + 1) * 32) void draft_ar_norm_spli
   device::PDLWaitPrimary<kUsePDL>();
   if constexpr (kEarlyTrigger) device::PDLTriggerSecondary<kUsePDL>();
 
-  const uint32_t phase = params.ws.counter[blockIdx.x].get() & 1;
-  if (blockIdx.x == 0) {
-    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kThreadsHere) {
-      params.ws.counter[i].set(phase ^ 1);
-    }
-  }
+  const uint32_t phase = params.ws.counter->load();  // after the PDL wait (EpochCounter::load)
 
   for (uint32_t unit = blockIdx.x / kCluster; unit < units; unit += gridDim.x / kCluster) {
     const uint32_t req = unit / kSplit, p = unit % kSplit;
@@ -639,7 +630,7 @@ __global__ __launch_bounds__((kBlock / kSplit + 1) * 32) void draft_ar_norm_spli
   }
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.ws.counter->commit();  // once per block, after the barrier
 }
 
 }  // namespace muse_vr_draft_arn
@@ -702,14 +693,13 @@ struct MuseVrDraftArNorm {
     RuntimeCheck(push.world_size == kWorld, "the kernel is compiled for TP", kWorld);
     const int64_t nbytes = int64_t(rows) * kHidden * 2;
     RuntimeCheck(nbytes <= int64_t(push.slot_bytes), "rows exceed the push slot size");
-    const uint32_t clusters = std::min<uint32_t>(p.num_requests, push.num_blocks / kCluster);
-    RuntimeCheck(clusters >= 1, "the push plane has fewer block counters than one cluster");
+    const uint32_t clusters = std::min<uint32_t>(p.num_requests, push.default_blocks / kCluster);
+    RuntimeCheck(clusters >= 1, "the push plane's default launch width is below one cluster");
     const uint32_t grid = clusters * kCluster;
     p.ws = push.get_workspace<kWorld>(nbytes);
     if constexpr (kMcPush) {
       RuntimeCheck(p.ws.mc_workspace != nullptr, "the multicast push needs a push plane with a multicast address");
     }
-    p.num_counters = push.num_blocks;
     p.rank = push.rank;
     p.partial = static_cast<const uint4*>(partial.data_ptr());
     p.partial_all = nullptr;
@@ -774,14 +764,13 @@ struct MuseVrDraftArNormSplit {
     const int64_t nbytes = (int64_t(rows) + int64_t(p.num_requests) * (kSplit - 1)) * kHidden * 2;
     RuntimeCheck(nbytes <= int64_t(push.slot_bytes), "rows exceed the push slot size");
     const uint32_t units = p.num_requests * kSplit;
-    const uint32_t clusters = std::min<uint32_t>(units, push.num_blocks / kCluster);
-    RuntimeCheck(clusters >= 1, "the push plane has fewer block counters than one cluster");
+    const uint32_t clusters = std::min<uint32_t>(units, push.default_blocks / kCluster);
+    RuntimeCheck(clusters >= 1, "the push plane's default launch width is below one cluster");
     const uint32_t grid = clusters * kCluster;
     p.ws = push.get_workspace<kWorld>(nbytes);
     if constexpr (kMcPush) {
       RuntimeCheck(p.ws.mc_workspace != nullptr, "the multicast push needs a push plane with a multicast address");
     }
-    p.num_counters = push.num_blocks;
     p.rank = push.rank;
     p.partial = static_cast<const uint4*>(partial.data_ptr());
     p.partial_all = nullptr;

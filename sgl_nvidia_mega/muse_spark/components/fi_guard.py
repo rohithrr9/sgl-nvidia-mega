@@ -55,6 +55,11 @@ ARTIFACTS = {
         "35cb99413a3ebce2e87a03fc04196e528e22c8d5/batched_gemm-fdba669-7e3d0a6/",
         "66b467a012dcefadbb56c993796397d81d2768a70b3dcd6235fe9e125b07971f",
     ),
+    # FlashInfer 0.7.4 (SGLang 3117f58 image): listed, not in CLEARED
+    "0.7.4": (
+        "8ee504560a86b6c72b8c941d3003e8fb1804b1b6/batched_gemm-fdba669-16ba8ed/",
+        "49bce842233a46c95ede250f9fc0dc10ca1cfb18f48ccb7b4123400d73403687",
+    ),
 }
 
 # versions each component's unit records were taken on (others are cleared per run with MUSE_VR_FI_CLEARED)

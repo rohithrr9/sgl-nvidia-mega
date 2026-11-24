@@ -153,7 +153,8 @@ def supported(
         or comm.disabled
         or not 2 <= comm.world_size <= _MAX_WORLD
         or num_tokens <= 0
-        or num_tokens * hidden_size * 2 > comm.max_push_size
+        or num_tokens * hidden_size * 2
+        > comm._max_push_size  # the push slot its 1shot_push may use
     ):
         return False
     try:

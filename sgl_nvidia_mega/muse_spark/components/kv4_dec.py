@@ -41,10 +41,27 @@ PINS = {
     "sglang/srt/models/muse_spark.py": (
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        # the method sgl_shims splits into gated_attention (the hook target)
+        bed.Functions(
+            {
+                "MuseSpark1xAttention.__init__": "6c44d00fb22adfb0",
+                "MuseSpark1xAttention.forward": "68d6e28fc80defe8",
+            }
+        ),
     ),
     "sglang/srt/layers/attention/trtllm_mha_backend.py": (
         "566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4",
         "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+        # the FP8-KV extend path the layer's view runs (and verify_attn's checks of it)
+        bed.Functions(
+            {
+                "TRTLLMHAAttnBackend.forward_extend": (
+                    "9ddde6d7d3f6d4be",
+                    "8e36076dafabff66",
+                ),
+                "TRTLLMHAAttnBackend._forward_extend_uses_native_fp4": "2ca6caa1239a837a",
+            }
+        ),
     ),
 }
 

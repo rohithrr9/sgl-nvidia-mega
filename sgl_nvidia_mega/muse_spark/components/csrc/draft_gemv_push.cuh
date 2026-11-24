@@ -5,15 +5,19 @@
 // output projection or MLP down projection) stores its output tile as the plain epilogue does and also pushes every 16-byte
 // vector into the peers' slots of the custom all-reduce push plane, exactly where the layer boundary kernel
 // (draft_ar_norm.cuh, one-shot push protocol) would have pushed it. The boundary then runs with kConsumerOnly (polls, sums,
-// clears and flips the phase counters as before, without pushing). Same vectors in the same slots: the boundary's outputs are
+// clears and commits the phase word as before, without pushing). Same vectors in the same slots: the boundary's outputs are
 // bit-identical to the plain GEMV followed by the full boundary kernel.
+// Ported to SGLang 3117f58's push plane (communicator.cuh): the GEMV only reads the plane's EpochCounter phase word (after
+// its PDL wait) and runs between the previous kernel's commit and the boundary's, as that protocol requires of a producer
+// whose paired consumer commits.
 //
 // kMcPush: every vector is stored once through the push plane's multicast address instead of once per peer; that store
 // also writes this rank's own slot, so the boundary must then run with kConsumerOnly and kMcPush (it polls and scrubs the
 // own slot as for its own multicast push). Same vectors in the same slots: bit-identical outputs.
 //
 // Requirements (checked): rows are whole 8-token request blocks; the boundary would use one cluster of `consumer_cluster`
-// CTAs per request block without looping (requests x consumer_cluster <= the plane's block counters); the output fits a slot.
+// CTAs per request block without looping (requests x consumer_cluster <= the plane's default launch width); the output fits
+// a slot.
 
 #pragma once
 
@@ -45,10 +49,10 @@ struct MuseVrDraftGemvPush {
     RuntimeCheck(m % 8 == 0, "draft_gemv push: rows must be whole request blocks");
     RuntimeCheck(consumer_cluster >= 1 && n % (8 * consumer_cluster) == 0, "draft_gemv push: column slices");
     RuntimeCheck(m * n * 2 <= int64_t(push.slot_bytes), "draft_gemv push: rows exceed the push slot size");
-    RuntimeCheck((m / 8) * consumer_cluster <= int64_t(push.num_blocks), "draft_gemv push: the boundary would loop");
+    RuntimeCheck((m / 8) * consumer_cluster <= int64_t(push.default_blocks), "draft_gemv push: the boundary would loop");
     const auto ws = push.get_workspace<kWorld>(m * n * 2);
     for (uint32_t i = 0; i < kWorld; ++i) params.push_ws[i] = ws.workspaces[i];
-    params.push_counter = reinterpret_cast<const uint32_t*>(ws.counter);
+    params.push_counter = reinterpret_cast<const uint32_t*>(ws.counter);  // EpochCounter: [0] low, [1] high half
     params.push_slot_bytes = ws.slot_bytes;
     params.push_world = static_cast<int>(kWorld);
     params.push_rank = static_cast<int>(push.rank);

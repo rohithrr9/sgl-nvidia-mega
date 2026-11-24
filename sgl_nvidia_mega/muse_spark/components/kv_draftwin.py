@@ -14,10 +14,11 @@ as the target's verify block in the same iteration. This component stores the dr
 * The draft pool is an ``SWAKVPool`` with no full-attention layers and every draft layer on its sliding-window side,
   sized to the target's sliding-window token count and registered on the target allocator's full->SWA mapping. This
   is the plumbing SGLang already uses for sliding-window EAGLE/MTP drafts: the FlashAttention backends translate the
-  page table and the write locations, ``KVIndexTranslator`` gets a SLIDING_WINDOW id space, and HiCache builds an
-  SWA-indexed draft sidecar whose pages follow the target's sliding-window pages (``build_swa_draft_pools``).
-* DFLASH's own draft KV writes (prompt materialization by location, the post-verify prefix-valid commit) arrive with
-  full-attention ids; the pool translates them through the same mapping, once per materialization call.
+  page table and the write locations, the draft runner's ``RunnerIds`` gets a SLIDING_WINDOW id space, and HiCache
+  builds an SWA-indexed draft sidecar whose pages follow the target's sliding-window pages (``build_swa_draft_pools``).
+* DFLASH's own draft KV writes (prompt materialization by location, the post-verify prefix-valid commit) carry that
+  id space's sliding-window ids (``swa_cache_loc``); a write that reaches the pool with full-attention ids only is
+  translated through the same mapping, once per materialization call.
 * The pool budget charges the draft's bytes per sliding-window token (``x swa_full_tokens_ratio``) instead of per full
   token, so the memory that held never-read draft KV becomes target tokens.
 
@@ -30,7 +31,7 @@ are skipped or masked by the kernel and contribute exact zeros, so the draft's o
 Engaged only when: DFLASH (not DSPARK) with the fa4 draft attention backend, the target is hybrid sliding-window with
 a non-unified, paged, non-ring ``SWATokenToKVPoolAllocator``, every draft layer is a sliding-window layer with
 window_left <= the target's, no DCP / PP / disaggregation / unified memory / page-major layout, and the SGLang sources
-match their sha256 pins. The decision is taken once, when the target pool is sized; the draft pool build re-checks it
+match their pins. The decision is taken once, when the target pool is sized; the draft pool build re-checks it
 against the loaded draft model and raises rather than fall back to a full-size pool the budget did not charge. At the
 first draft KV write, every attention backend of the draft runner is checked to read the pool through its
 sliding-window page table (``kv_draftwin:attn`` engagement record; raises otherwise).
@@ -81,70 +82,215 @@ T_SWA_CELL = "sglang.srt.model_executor.pool_configurator.HybridSWAPoolConfigura
 T_BUILD = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_token_to_kv_pool"
 T_APPEND = "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc"
 
-# sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) whose behaviour this relies
-# on: the DFLASH worker's draft KV writes, the pool / allocator / configurator code that builds and sizes the pools,
-# the sliding-window pool and its full->SWA mapping, the out-of-window freeing rule, the FlashAttention backend's
-# sliding-window translation, the index translator, the HiCache sidecar builder and the draft's window convention.
+# The SGLang sources (relative to the directory holding the ``sglang`` package) whose behaviour this relies on, pinned
+# by the digests of the functions it hooks, calls or depends on: the DFLASH worker's draft KV writes, the pool /
+# allocator / configurator code that builds and sizes the pools, the sliding-window pool and its full->SWA mapping,
+# the out-of-window freeing rule, the FlashAttention backend's sliding-window translation, the runner's id spaces and
+# the layer router (the index translator's successors), the HiCache sidecar builder and the draft's window convention.
 PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
-        "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
-        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        bed.Functions(
+            {
+                "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
+                "DFlashWorkerV2._draft_write_ids": "bd6b4184c0c2e851",
+                "DFlashWorkerV2._append_target_hidden_decode": "3e8ed52bddd81088",
+                "DFlashWorkerV2._append_target_hidden_sequential": "c0f175a24ed32573",
+                "DFlashWorkerV2._append_target_hidden_fused": "c40ffaf1f6f3074f",
+                "DFlashWorkerV2._draft_kv_full_to_swa_mapping": "8b88568d70254f56",
+                "DFlashWorkerV2.forward_batch_generation": "d05d129bac415b00",
+            }
+        ),
     ),
     "sglang/srt/speculative/dflash_utils.py": (
-        "6e0423578bade4a8c58b921430df678840c6fa2de6ea411fe58eb77c98d5a820",
-        "35e885f930e95ed82a1f47a0dfa2dab583225d170c6cabe54f6c7bb4e3abbf79",
+        bed.Functions(
+            {
+                "get_dflash_attention_sliding_window_size": "352ff0d705840d21",
+                "get_dflash_layer_types": "1476af5b7f476f6a",
+            }
+        ),
     ),
     "sglang/srt/models/dflash.py": (
-        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
-        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "_get_dflash_layer_attention_params": "e679d4d9479e8970",
+                "DFlashAttention.__init__": "00710456bf5598ff",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/memory_pool.py": (
-        "b439441448d1112952876cd5f814ea47fcd561ece1a9aa0e7d2080d5f4874106",
-        "f3e12b293f3bdce21604ca5e5b473c07dcb6c8e4a34b582c4498d0bd45a10900",
+        bed.Functions(
+            {
+                "KVWriteLoc.__post_init__": "6eb2d5175b280836",
+                "unwrap_write_loc": "85a8f48bd41e6a3e",
+                "write_loc_is_physical": "dce2d36b1283495f",
+                "layer_window_locs": "3d2af5fc26b11ad3",
+                "KVCache.id_spaces": "d3382cd1db764a07",
+                "KVCache.layer_router": "a2951e1240c315b6",
+                "MHATokenToKVPool.__init__": "19352e82644dfacc",
+                "MHATokenToKVPool.set_kv_buffer_prefix_valid": "ed389fc54eab86ff",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/swa_memory_pool.py": (
-        "5d518102fad0bb444176815e1e829a63197b6939ff656bf282253ffa09c90fab",
-        "14f2b1daebdc9d872b5786cfc0beed26a413bb41717b70a737a4cb4c31951dfc",
+        bed.Functions(
+            {
+                "SWAKVPool.__init__": "3f1c9a5f1d7bc949",
+                "SWAKVPool.register_mapping": "6824f04fbe5c103b",
+                "SWAKVPool._build_layer_router": "91d33a672b259ae3",
+                "SWAKVPool.translate_loc_from_full_to_swa": "70243eb01e970ff6",
+                "SWAKVPool._window_loc": "d0c711bd5889df51",
+                "SWAKVPool.set_kv_buffer": "cd878f8998497793",
+                "SWAKVPool.finalize_backing": "09a05b6f2c207f9a",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/allocator/swa.py": (
-        "5e87b8dd8552d4b0f95012c8bd829b469d2cd06cdc57f2dee2d9ec635fc0f1f7",
-        "57e6e797556d8e6d696a9343de3fe2f447ab3ae473b7588b025e59d555a63665",
+        bed.Functions(
+            {
+                "SWATokenToKVPoolAllocator.__init__": "c838829da5e8d982",
+                "SWATokenToKVPoolAllocator.swa_req_ring": "f099a89ea5170d7a",
+                "SWATokenToKVPoolAllocator.alloc_extend": "e1bb9f7e20755438",
+                "SWATokenToKVPoolAllocator.alloc_extend_swa_tail": "1aeba2b5126a26c6",
+                "SWATokenToKVPoolAllocator.alloc_decode": "39719026a48f194b",
+                "SWATokenToKVPoolAllocator.set_full_to_swa_mapping": "660dde1e7986f4bf",
+                "SWATokenToKVPoolAllocator.clear_full_to_swa_mapping": "8e6b7b314385284a",
+                "SWATokenToKVPoolAllocator.free_swa": "f695877b69b4b551",
+                "SWATokenToKVPoolAllocator.free_swa_segment": "8868db8e30129b64",
+                "SWATokenToKVPoolAllocator.resize": "c4cd6b3f826728c8",
+                "SWATokenToKVPoolAllocator.clear": "38778eb4cfc31bca",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/common.py": (
-        "32112d8a228fa2d2c70062408f63a4e2e4bca1d1c99a3e9a584719de4b5407d3",
-        "31855ecda6410c78966952c3d19b1b6556f13a23b7378cc05df51320ba2e43f1",
+        # The out-of-window freeing rule moved to kv/advance.py and kv/alloc/demand.py (pinned below).
+        bed.Functions({}),
+    ),
+    "sglang/srt/mem_cache/kv/advance.py": (
+        bed.Functions({"retire_window_rows": "a84251d975d2c05e"}),
+    ),
+    "sglang/srt/mem_cache/kv/alloc/demand.py": (
+        bed.Functions({"retained_window_tokens": "f7f533ae28932995"}),
     ),
     "sglang/srt/mem_cache/kv_cache_configurator.py": (
-        "570b22f6aca4d7bb2330fc15a5912ee2f61e500626cce21d69c27e71ec132fb2",
-        "5f7f4132923880cb2aa58ef55a5b18233df20bf1ffd47eb0d27b9781a8226c67",
+        bed.Functions(
+            {
+                "KVCacheConfigurator.__post_init__": "416dc38de735ecce",
+                "KVCacheConfigurator.loc_space_scale": "feca89c797adda3c",
+                "KVCacheConfigurator.pool_page_size": "ebf2c0867ed42812",
+                "KVCacheConfigurator._init_pools": "bbc400d8e1c09b3f",
+                "KVCacheConfigurator._build_token_to_kv_pool": "a21976ab0cd6645c",
+                "KVCacheConfigurator._build_hybrid_swa_kv_pool": "589c8f0e74b6f106",
+                "KVCacheConfigurator._build_mha_kv_pool": "8a7f0e1ccfb18a4f",
+                "KVCacheConfigurator._resolve_kv_pool_class": "0aae2026f8fe76b9",
+                "KVCacheConfigurator._build_token_to_kv_pool_allocator": "4f981c21c2d830b1",
+            }
+        ),
     ),
     "sglang/srt/model_executor/pool_configurator.py": (
-        "d6e49edf1d7f6cd23f435257b0230b97fb23d401051c36e1c3b386b24b018c2d",
-        "abcadf80aa7dceb6eb1c54735132ec300f1e150d52cd9d95a6bac23620b90ac5",
+        bed.Functions(
+            {
+                "_charges_dflash_draft_kv_per_token": "079d8c7975574169",
+                "_dflash_draft_cell_size": "ea8d7ae1397b93d4",
+                "dflash_draft_kv_follows_target_swa": "b7ab0d7288ab17b5",
+                "HybridSWAPoolConfigurator.__init__": "9d05903465f426e0",
+                "HybridSWAPoolConfigurator._full_cell_bytes": "947871da13838ec8",
+                "HybridSWAPoolConfigurator._swa_cell_bytes": "dad6782e0d792163",
+                "HybridSWAPoolConfigurator._recompute_cell_size": "cf1e80ad7cc0d50b",
+                "HybridSWAPoolConfigurator._make_pool_config": "857d0b960e07daf1",
+                "HybridSWAPoolConfigurator.calculate_pool_sizes": "2d113f3e80677abc",
+                "SWARequestCapPoolConfigurator.calculate_pool_sizes": "c14a363568efbcce",
+            }
+        ),
     ),
     "sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py": (
-        "9622b2dfbcc9594a6639dcb78fa276eef3337731f5920c158f85ca3c7cb585ac",
-        "5e20b0e7fe9850f8545f8609b546c114842f314542b0fb167664ca90694c8082",
+        bed.Functions(
+            {
+                "is_post_capture_kv_active": "4e1ae8e7e44ed0dd",
+                "compute_post_capture_kv_resize": "57a608c371c6c6ae",
+            }
+        ),
     ),
     "sglang/srt/layers/attention/flashattention_backend.py": (
-        "53489175aace7b97498efb10ae8b01c489d35e91058842eee02b19aec18f1a3c",
-        "a7b8d205742765e12bf0bad48b151007258736e31f6c97a03725cac6ca2c1d17",
+        bed.Functions(
+            {
+                "FlashAttentionBackend.__init__": "37e0cc6dacc93c70",
+                "FlashAttentionBackend._maybe_init_local_attn_builder": "4074c8cc6c8b0727",
+                "FlashAttentionBackend.init_forward_metadata_in_graph": "87561051b6eb2b0d",
+                "FlashAttentionBackend._in_graph_full_to_swa_index_mapping": "5081e1eda58a99d0",
+                "FlashAttentionBackend.draft_extend_metadata_captured_in_graph": "1adaad9a5dc72f6f",
+                "FlashAttentionBackend._get_swa_write_locations": "571f61360b236421",
+                "FlashAttentionBackend._init_full_cg_decode_metadata": "04e6d11ff21725a4",
+                "FlashAttentionBackend._init_full_cg_prefill_metadata": "6e04645cac0d5032",
+                "FlashAttentionBackend.init_forward_metadata": "29f40b8f89eee5b9",
+                "FlashAttentionBackend.get_fused_kv_write_buffers": "6d75860f4ef08c02",
+                "FlashAttentionBackend.forward_extend": "6ef18b40dc548054",
+                "FlashAttentionBackend.forward_decode": "d6c4b0eea2d64858",
+                "FlashAttentionBackend.init_cuda_graph_state": "1ee66c94c05cdda5",
+                "FlashAttentionBackend._bind_metadata_buffers": "1f4d871f060bfebb",
+                "FlashAttentionBackend._set_decode_page_metadata": "78fcc4ffc9e20462",
+                "FlashAttentionBackend._apply_cuda_graph_metadata": "22db4bd7601e038a",
+                "FlashAttentionBackend._init_sliding_window_attn_spec_metadata": "94e6d4ea5504df4d",
+            }
+        ),
     ),
-    "sglang/srt/mem_cache/kv_index_translator.py": (
-        "a88d376a1289ebbb3ede7b3dae461c631bbd45a0735610cd63d53fcb4d5e1659",
-        "1d2a73c303a3e1dfe4e82eeb73a9a17daa7d4c802259e389c55f51f97ffb0396",
+    # Removed upstream: the sliding-window id space is the pool's (BaseSWAKVPool.id_spaces), resolved per runner by
+    # RunnerIds / IterationIds and written through the layer router (pinned below).
+    "sglang/srt/mem_cache/kv_index_translator.py": ("absent",),
+    "sglang/srt/mem_cache/base_swa_memory_pool.py": (
+        bed.Functions({"BaseSWAKVPool.id_spaces": "1fb54bf10cedfd05"}),
+    ),
+    "sglang/srt/mem_cache/kv/alloc/runner_ids.py": (
+        bed.Functions(
+            {
+                "_target_swa_space": "b7728413b9ac11b0",
+                "RunnerIds.__init__": "0a3307e760c36cd0",
+                "RunnerIds.sub_pool_name": "4f92e59e42267804",
+                "RunnerIds.space": "7b390f444acf6684",
+                "RunnerIds.ids_in": "5d6bc66bfaad0f9d",
+                "RunnerIds.window_storage": "8962dfa20e91fab8",
+                "RunnerIds.write_ids": "ef624e6b75bc362c",
+                "RunnerIds.read_table": "3b76b6a5230e2c29",
+            }
+        ),
+    ),
+    "sglang/srt/mem_cache/kv/alloc/iteration_ids.py": (
+        bed.Functions(
+            {
+                "IterationIds.bind": "8101462174fe0a6c",
+                "IterationIds.write_ids": "e58d6011b3096224",
+                "IterationIds._window_in": "3da794bc0c20e1cd",
+            }
+        ),
+    ),
+    "sglang/srt/mem_cache/kv/router.py": (
+        bed.Functions(
+            {
+                "KVLayer.store": "8421bfb2701a0177",
+                "KVLayer.store_prefix": "f943b62840142a9d",
+                "KVLayer._write_loc": "a08be60b12a113f2",
+                "KVLayerRouter.from_layer_maps": "17b674f74e5c75a4",
+                "KVLayerRouter.routes_to": "dbcc41872ab5044a",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py": (
-        "35365ec237d193ac77b5adbba9fe239cde205e3747b0da635d3491126b594ac7",
-        "a5e1156a9db13593641ea9d649769761ce745fe82cf17c087a59b300d67e17ae",
+        bed.Functions(
+            {
+                "build_swa_draft_pools": "a6109f4b22f817bc",
+                "build_hicache_draft_sidecars": "f6adaff08539d32f",
+            }
+        ),
     ),
     "sglang/srt/mem_cache/kv_cache_builder.py": (
-        "79808d4f054dc9edbae0c5c1e2d92818442d74b8a66381f6835eaa64f135853c",
-        "578ce61e11904331f6a0bf7d85bf7f5679249b4d1a6718860a9c71b44ad45147",
+        bed.Functions({"maybe_register_hicache_draft": "fa9eebe0c315d774"}),
     ),
     "sglang/srt/speculative/base_spec_worker.py": (
-        "5c3ad14c99df94699e210a766d25bc69a14d89895708bcab50cc9da169849ea1",
-        "badea4156c24c06848cdf7b572ccb08bf4a74e8e580c38795ff9de560546d168",
+        bed.Functions(
+            {
+                "BaseSpecWorker._draft_model_runners": "2db3de39d47a040f",
+                "BaseSpecWorker._build_hicache_draft_plan": "833cbbcaa7803eb0",
+            }
+        ),
     ),
 }
 
@@ -215,7 +361,7 @@ def decide(kvc) -> tuple[dict | None, str]:
     aux = kvc.spec_aux_config
     draft_config = getattr(aux, "draft_model_config", None)
     n_layers = getattr(aux, "dflash_draft_num_layers", None)
-    cell = getattr(aux, "dflash_draft_cell_size_per_token", None)
+    cell = kvc.dflash_draft_cell_size_per_token
     if draft_config is None or not n_layers or not cell:
         return None, "draft geometry unresolved"
     from sglang.srt.speculative.dflash_utils import (
@@ -320,7 +466,7 @@ def pool_class():
 
     class DraftWindowSWAKVPool(SWAKVPool):
         """DFLASH draft pool: every layer on the sliding-window side, indexed through the target's full->SWA mapping.
-        Writes that arrive with full-attention ids (DFLASH's own materialization) are translated here."""
+        Writes that arrive with full-attention ids only are translated here."""
 
         kvdw_translations = 0
 
@@ -343,11 +489,11 @@ def pool_class():
         def set_kv_buffer(
             self, layer, loc_info, cache_k, cache_v, k_scale=1.0, v_scale=1.0
         ):
-            loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
-            if swa_loc is None:
+            loc, window_locs, full_loc = unwrap_write_loc(loc_info)
+            if window_locs is None:
                 loc_info = KVWriteLoc(
                     loc,
-                    swa_loc=self.kvdw_to_swa(loc),
+                    window_locs={self.WINDOW_SUB_POOL: self.kvdw_to_swa(loc)},
                     full_loc=full_loc,
                     physical=write_loc_is_physical(loc_info),
                 )
@@ -399,7 +545,7 @@ def build_draft_pool(kvc, p: dict):
     import torch
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     alloc = kvc.token_to_kv_pool_allocator
     if type(alloc) is not SWATokenToKVPoolAllocator or alloc.swa_req_ring:
@@ -466,7 +612,6 @@ def build_draft_pool(kvc, p: dict):
         token_to_kv_pool_class=MHATokenToKVPool,
         enable_memory_saver=get_exec().features.enable_memory_saver,
         post_capture_active=kvc.post_capture_kv_active,
-        enable_alt_stream=not get_disagg().enable_pdmux,
         enable_kv_cache_copy=True,
     )
     pool.register_mapping(alloc.full_to_swa_index_mapping)

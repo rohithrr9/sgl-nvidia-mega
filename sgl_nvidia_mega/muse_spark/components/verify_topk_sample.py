@@ -68,6 +68,14 @@ as at every other shape (exactly tied logits by ascending id). Before the first 
 two calls must agree and select the lowest ids; otherwise the component keeps the stock path
 (``stock:topk self-check``).
 
+On the newer supported SGLang the stock builder selects with ``radix_topk`` (FlashInfer's deterministic radix top-k
+when FlashInfer is installed) on the soft-capped logits and divides only the selected values by the temperature. The
+selected values, their order and the probabilities are the same as above; where values tie at the k-th place (after
+the division), FlashInfer takes the tied ids in its own collection order, not the lowest ids, so there the selected ids
+can differ from this component's (as with ``MUSE_VR_VERIFY_TOPK_SAMPLE_LOWTIE=1``). Its selector accept also returns
+the cut counts of a ragged verify (zeros without a cutoff), which the component returns the same way; with a
+ragged-verify planner the step keeps the stock path (``stock:ragged verify``).
+
 Preload: the CUDA modules, that self-check, the record planes and the Triton kernels' compiles are not left to the
 first top-k step (a served request). Every verify step ends in ``finish_deferred_gather`` (a sampled batch) or
 ``deferred_argmax`` (a greedy batch: the worker sets the selector sample only for sampled batches), both on the
@@ -150,25 +158,115 @@ PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
         "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
         "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        # The hooked decision, accept and selector sampling, and the verify step that hands the logits between them.
+        bed.Functions(
+            {
+                "DFlashWorkerV2._can_skip_verify_logits": (
+                    "44d65789838d384e",
+                    "15873dd1a0898f8f",
+                ),
+                "DFlashWorkerV2._accept_block": (
+                    "a04a15a5ec8319b8",
+                    "190b55ea70b35e32",
+                ),
+                "DFlashWorkerV2._selector_sampling_accept": (
+                    "ebd8291583a59153",
+                    "3b438e96b917e4fd",
+                ),
+                "DFlashWorkerV2.forward_batch_generation": (
+                    "d05d129bac415b00",
+                    "a247f467ef4e5b8b",
+                ),
+            }
+        ),
     ),
     "sglang/srt/speculative/dflash_utils.py": (
         "6e0423578bade4a8c58b921430df678840c6fa2de6ea411fe58eb77c98d5a820",
         "35e885f930e95ed82a1f47a0dfa2dab583225d170c6cabe54f6c7bb4e3abbf79",
+        # The newer builder selects with radix_topk on the soft-capped logits, then divides (module docstring).
+        bed.Functions(
+            {
+                "build_speculative_verify_target_probs": (
+                    "0c06dfe3891fb1f6",
+                    "ab649ca0cff3156b",
+                ),
+                "_get_or_create_chain_verify_buffers": (
+                    "c3eb1d5021f003ff",
+                    "dd33ec0360d40db5",
+                ),
+            }
+        ),
     ),
     "sglang/kernels/ops/speculative/dspark/dspark_accept.py": (
         "6202a51f6d2f3a79fef3cbef2aee04296640087be2402d8b11a7f1b394015a9c",
         "4d87d25d0510a309e7f3484c0d2c6d806da39bd5557096c49b9ac2a92e5c3ddf",
+        # The newer core adds a ROCm-only split path; the CUDA top-k path (draws, buffers, bonus) is the same.
+        bed.Functions(
+            {
+                "_accept_sampling_core": ("0af3df5843db8b24", "2b354a14b1e4a76d"),
+                "accept_sampling": "be7039fa82d71805",
+            }
+        ),
     ),
-    "sglang/kernels/ops/speculative/reject_sampling.py": "62caac17755082e2f89b1c81a743f55c81c31b7ff0485b7533c0267e72e9262c",
+    "sglang/kernels/ops/speculative/reject_sampling.py": (
+        "62caac17755082e2f89b1c81a743f55c81c31b7ff0485b7533c0267e72e9262c",
+        # The mirrored kernel is unchanged; below the multiprocessor count the newer launcher runs its split
+        # final-token pass, which SGLang keeps bit-identical to that kernel (fp32 p and q).
+        bed.Functions(
+            {
+                "speculative_sampling_classic_kernel": "3c0aae546abc7d8e",
+                "chain_speculative_sampling_triton": (
+                    "6148152b86c3c748",
+                    "6f333a07c08dcbe4",
+                ),
+            }
+        ),
+    ),
     "sglang/srt/layers/logits_processor.py": (
         "ecc0318937eee486414f6ae7165f2d1de17c01794a25aae83a99af61cbb0e3d0",
         "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+        # The newer gather and argmax differ only without a soft cap (a plain gather) and on ROCm.
+        bed.Functions(
+            {
+                "LogitsProcessor.finish_deferred_gather": (
+                    "e87ef0b749b82fa4",
+                    "589dab9e9b5fc360",
+                ),
+                "LogitsProcessor.deferred_argmax": (
+                    "675a820ec0fc2b7c",
+                    "1e5111a67161cca3",
+                ),
+                "LogitsProcessor._gather_softcap_fused": "d4c2d76b2a1dacbd",
+                "LogitsProcessor.is_deferred_shard": "8c58df706e00e0d2",
+            }
+        ),
     ),
     "sglang/kernels/ops/activation/softcap.py": (
         "deeb037d3d3e28f24a243719fc9e2ebc2aa065d00138fb9e22065c1d36943e90",
         "b6591c8605984960ff88fcab92c6e9e36658f89497507948777a53d41d310ee8",
+        # The newer kernel casts to fp32 first (a no-op on fp32 shards) and skips the cap without one.
+        bed.Functions(
+            {
+                "_gathered_softcap_logits_kernel": (
+                    "56b04325b9ee42ee",
+                    "4086177de75ee2bd",
+                ),
+                "gathered_softcap_logits": ("5afbfd301b80747f", "76184f825761a2c9"),
+            }
+        ),
     ),
-    "sglang/srt/speculative/dflash_info_v2.py": "c66fd2a9629c5f0f36ad4eca34f2910dc8e8af509fd8c6b2fa3fd2722f18004f",
+    "sglang/srt/speculative/dflash_info_v2.py": (
+        "c66fd2a9629c5f0f36ad4eca34f2910dc8e8af509fd8c6b2fa3fd2722f18004f",
+        # max_top_k / uniform_top_k_value, which eligible() takes from the requests the same way.
+        bed.Functions(
+            {
+                "DFlashDraftInputV2.prepare_for_decode": (
+                    "bfaadefc01634785",
+                    "463a945dc4ce2ebf",
+                )
+            }
+        ),
+    ),
 }
 # (PyTorch build (torch.version.git_version), Triton release) pairs the bitwise test passed with (torch.topk selection,
 # softmax, soft-cap codegen, tile tl.sum / tl.cumsum lowering), each with the verify shapes where that build's
@@ -1439,12 +1537,17 @@ def eligible(worker, batch, sinfo) -> tuple[str | None, int]:
         return "not the selector path", 0
     if getattr(worker, "_block_verification", False):
         return "block verification", 0
+    # Newer SGLang: a ragged-verify planner cuts verify lengths (cutoff_verify_lens), which this path does not take.
+    if getattr(worker, "_verify_planner", None) is not None:
+        return "ragged verify", 0
     if batch.has_grammar or batch.return_logprob:
         return "grammar or logprobs", 0
-    penalizer = sinfo.penalizer_orchestrator
+    # The newer SamplingBatchInfo holds the step's penalties in step_penalties (no penalizer orchestrator).
+    penalizer = getattr(sinfo, "penalizer_orchestrator", None)
     if (
         sinfo.has_custom_logit_processor
         or getattr(sinfo, "acc_linear_penalties", None) is not None
+        or getattr(sinfo, "step_penalties", None) is not None
         or (penalizer is not None and penalizer.is_required)
         or getattr(sinfo, "grammar_mask", None) is not None
         or getattr(sinfo, "logit_bias", None) is not None
@@ -1635,9 +1738,8 @@ def _h_accept(original, worker, **kw):
         _tls.active = None
         return original(worker, **kw)
     try:
-        if (
-            worker._selector_sample is None
-        ):  # not the selector branch after all: it reads full rows
+        # not the selector branch after all (the newer one also needs no resolved argmax): it reads full rows
+        if worker._selector_sample is None or kw.get("target_predict") is not None:
             kw["next_token_logits"] = _full_logits(a)
             _tls.active = None
             bed.count(NAME, "fallback:full rows")
@@ -1670,7 +1772,8 @@ def _h_sample(original, worker, **kw):
     logits = kw.get("next_token_logits")
     if a is None or logits is not a["out"]:
         return original(worker, **kw)
-    if not _sample_layout_ok(
+    # a cutoff (ragged verify, which eligible() leaves to stock) caps the accept: the stock accept handles it
+    if kw.get("cutoff_verify_lens") is not None or not _sample_layout_ok(
         kw.get("candidates"), kw.get("candidate_ids"), kw.get("q_rows"), a
     ):
         bed.count(NAME, "fallback:full rows")
@@ -1690,7 +1793,11 @@ def _h_sample(original, worker, **kw):
         coins=coins,
     )
     bed.count(NAME, f"sample:bs={bs}")
-    return accept_len, bonus
+    # the earlier selector accept returns two tensors
+    if "cutoff_verify_lens" not in kw:
+        return accept_len, bonus
+    # the newer one also returns the cut counts: zeros without a cutoff, as its stock accept returns them
+    return accept_len, bonus, torch.zeros_like(accept_len)
 
 
 def register() -> bool:

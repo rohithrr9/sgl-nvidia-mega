@@ -10,7 +10,7 @@ of a KV head in one 64-row MMA, as the FP8-KV kernels do.
 Engaged per call (else the stock path runs unchanged) when: the backend is trtllm_mha with native NVFP4 decode, the
 batch is TARGET_VERIFY with a fixed 8 rows per request (not ragged, no context parallelism), the layer is a decoder
 layer without attention sinks, q is bf16 with 8 query heads per KV head, head_dim 64, an even KV-head count per rank and
-page size 128. The KV write is SGLang's own (``set_kv_buffer`` with the batch's write locations), then attention.
+page size 128. The KV write is SGLang's own (the layer's ``store`` with the batch's write locations), then attention.
 
 Numerics vs the stock native path: K/V are the same stored E2M1 values and scales; the kernel rounds the dequantized
 product to E4M3 (the FP8 MMA operand), q to E4M3 (as stock) and the probabilities to E4M3 (as the FP8 recipe), and writes
@@ -38,7 +38,9 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
     "srt/layers/cp/utils.py": ("is_cp_active",),
     "srt/layers/radix_attention.py": ("AttentionType",),
-    "srt/mem_cache/memory_pool.py": ("KVWriteLoc",),
+    "srt/mem_cache/memory_pool.py": ("KVWriteLoc", "window_write_locs"),
+    "srt/layers/attention/base_attn_backend.py": ("kv_layers",),
+    "srt/layers/attention/flashinfer_backend.py": ("runner_ids",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
 
@@ -181,7 +183,7 @@ def _forward_extend_around(
     import torch
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.layers.radix_attention import AttentionType
-    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 
     md = self.forward_metadata
     if (
@@ -204,9 +206,12 @@ def _forward_extend_around(
     from .ops.nvfp4_verify_attn import nvfp4_verify_attn
 
     if save_kv_cache and k is not None:
-        self.token_to_kv_pool.set_kv_buffer(
+        self.kv_layers.layer(layer.layer_id).store(
             layer,
-            KVWriteLoc.for_batch(forward_batch, swa_loc=md.swa_out_cache_loc),
+            KVWriteLoc.for_batch(
+                forward_batch,
+                window_locs=window_write_locs(self.runner_ids, md.swa_out_cache_loc),
+            ),
             k,
             v,
             *self._kv_write_scales(layer),

@@ -16,7 +16,7 @@ call runs SGLang's ``2shot_push`` kernel instead (its slot, ``ceil(n / 8)`` roun
 push workspace the stock table sized for ``1shot_push`` at that size). Nothing else changes: the stock table, the workspace
 sizes, ``should_custom_ar`` and the ``uses_one_shot_push`` / ``uses_two_shot_push`` answers that fused kernels (the
 Muse Spark finalize all-reduce, ``ar_attn_boundary``) consult stay stock, so those fused paths engage exactly as
-before. Explicit ``override_algo`` calls are left alone.
+before. Explicit ``forced_algo`` calls are left alone.
 
 With ``MUSE_VR_CAR_TABLE_PULL_MAX_KB=<n>`` (default 0 = off) the same swap also applies to messages the stock table
 sends to ``2shot_pull`` (multicast or not) up to ``n`` KB, as long as the ``2shot_push`` slot fits the push workspace.
@@ -51,6 +51,17 @@ SGLANG_READS = {
     "srt/distributed/device_communicators/configs/custom_all_reduce_v2.py": (
         "two_shot_push_slot_bytes",
     ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+        "custom_all_reduce",
+        "choose_algo",
+        "forced_algo",
+        "_max_push_size",
+        "_can_use_graph",
+        "config",
+        "world_size",
+        "obj",
+    ),
 }
 
 
@@ -61,10 +72,18 @@ SGLANG_PINS = {
     "sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py": (
         "194512e1a61907198836d5f720d4c9110172abc456168aa37e2df0aba34ace8b",
         "eb510c72ab31df1c681e48ce2958db03f91a860ccbf152c0cfa6cbbf4495c91f",
+        bed.Functions({"two_shot_push_slot_bytes": "378bb871064a1ec7"}),
     ),
+    # The wrapper reads the stock choice through choose_algo / forced_algo / _max_push_size (3117f58 + #48948 names): the
+    # 306ccf6-era revisions (_pick_config / override_algo / max_push_size) are no longer accepted.
     "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
-        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+        bed.Functions(
+            {
+                "CustomAllReduceV2.custom_all_reduce": "a10d0b9bb845cf6d",
+                "CustomAllReduceV2._can_use_graph": "eb51b502ef50861d",
+                "choose_algo": "f28ff2065cefdce8",
+            }
+        ),
     ),
 }
 WORLD = 8
@@ -150,17 +169,13 @@ def install() -> None:
                 else torch.cuda.current_device()
             )
             arch.append(device_key(index) in SWEPT_DEVICES)
-        if (
-            not arch[0]
-            or self.world_size not in widths
-            or self.override_algo is not None
-        ):
+        if not arch[0] or self.world_size not in widths or self.forced_algo is not None:
             return stock(self, input)
         one_shot, pull_max = widths[self.world_size]
         nbytes = input.numel() * input.element_size()
         if nbytes <= one_shot or nbytes % 16:
             return stock(self, input)
-        cfg = self._pick_config(nbytes, self._can_use_graph())
+        cfg = car.choose_algo(self.config, nbytes, can_use_graph=self._can_use_graph())
         if cfg is None:
             return stock(self, input)
         if cfg.algo == AllReduceAlgo.ONE_SHOT_PUSH:
@@ -169,7 +184,7 @@ def install() -> None:
             src = "2shot_pull_mc" if cfg.use_multicast else "2shot_pull"
         else:
             return stock(self, input)
-        if two_shot_push_slot_bytes(nbytes, self.world_size) > self.max_push_size:
+        if two_shot_push_slot_bytes(nbytes, self.world_size) > self._max_push_size:
             return stock(self, input)
         key = (
             f"2shot_push:from={src}:M={input.shape[0] if input.dim() > 1 else nbytes}"

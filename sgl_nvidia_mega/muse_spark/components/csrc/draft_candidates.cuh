@@ -6,7 +6,9 @@
 // revision a55ab7d.
 // Modified by NVIDIA: gathers the per-rank top-k candidate records of the draft head instead of a bf16 column slice,
 // and merges them on every rank into the global top-k (same selection and order as SGLang's candidate_topk), then
-// applies the draft's unary logit transform.
+// applies the draft's unary logit transform. The plane's phase follows the single-counter protocol of SGLang
+// 3117f58 (communicator.cuh EpochCounter, as its muse_spark/all_gather.cuh uses it): every block of the grid reads
+// the phase after the PDL wait and commits once at its end.
 //
 // Inputs per rank (vocabulary shard of the head):
 //   vals: [N, kTopK] bf16, the shard's top-k logits (sorted, as the shard top-k returns them)
@@ -59,7 +61,6 @@ constexpr uint32_t kVecsPerRow = kRowBytes / 16;
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;
   uint32_t rank;
   uint32_t num_rows;
   int64_t vocab_start;  // this rank's first global id
@@ -317,16 +318,8 @@ __global__ __launch_bounds__(kThreads) void draft_candidates_kernel(const __grid
     }
     return;
   } else {
-    // the last block keeps the phase counters of the blocks this grid does not use in step
-    const uint32_t phase = params.ws.counter[bx].get() & 1;
-    if (bx == gridDim.x - 1) {
-      device::PDLTriggerSecondary<kUsePDL>();
-      for (uint32_t i = bx + threadIdx.x; i < params.num_counters; i += kThreads) {
-        params.ws.counter[i].set(phase ^ 1);
-      }
-      return;
-    }
-    const uint32_t work_blocks = gridDim.x - 1;
+    const uint32_t phase = params.ws.counter->load();
+    const uint32_t work_blocks = gridDim.x;
     const uint32_t half = phase * kWorld;
 
     // push this rank's rows of this block to every peer
@@ -376,7 +369,7 @@ __global__ __launch_bounds__(kThreads) void draft_candidates_kernel(const __grid
     }
     device::PDLTriggerSecondary<kUsePDL>();
     __syncthreads();
-    if (threadIdx.x == 0) params.ws.counter[bx].set(phase ^ 1);
+    if (threadIdx.x == 0) params.ws.counter->commit();
   }
 }
 
@@ -443,15 +436,13 @@ struct MuseVrDraftCandidates {
     RuntimeCheck(push.world_size == kWorld, "the kernel is compiled for TP", kWorld);
     const int64_t nbytes = int64_t(p.num_rows) * muse_vr_draft_cand::kRowBytes;
     RuntimeCheck(nbytes <= int64_t(push.slot_bytes), "rows exceed the push slot size");
-    RuntimeCheck(push.num_blocks >= 2, "needs a work block and a counter block");
     p.ws = push.get_workspace<kWorld>(nbytes);
-    p.num_counters = push.num_blocks;
     p.rank = push.rank;
     p.vocab_start = vocab_start;
     p.gathered = nullptr;
     const uint32_t want = div_ceil(p.num_rows, muse_vr_draft_cand::kWarpsPerBlock);
-    const uint32_t work = std::min<uint32_t>(want, push.num_blocks - 1);
-    LaunchKernel(work + 1, muse_vr_draft_cand::kThreads, device.unwrap())
+    const uint32_t work = std::min<uint32_t>(want, push.default_blocks);
+    LaunchKernel(work, muse_vr_draft_cand::kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(muse_vr_draft_cand::draft_candidates_kernel<kWorld, kUsePDL, false>, p);
   }
 

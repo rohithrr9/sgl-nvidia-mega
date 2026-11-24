@@ -39,13 +39,16 @@ from . import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
-    "srt/mem_cache/memory_pool.py": ("MHATokenToKVPool",),
+    "srt/mem_cache/memory_pool.py": ("MHATokenToKVPool", "layer_router"),
+    "srt/mem_cache/kv/router.py": ("read", "key", "value"),
     "srt/layers/attention/trtllm_mha_backend.py": ("TRTLLMHAAttnBackend",),
     "srt/layers/cp/utils.py": ("is_cp_active",),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
         "get_token_to_kv_pool",
     ),
+    "srt/runtime_context.py": ("get_memory",),
+    "srt/arg_groups/fields/memory.py": ("enable_unified_memory",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
 
@@ -59,13 +62,44 @@ TARGET_DECODE = (
     "sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend.forward_decode"
 )
 TARGET_STORE = "sglang.srt.models.muse_spark.MuseSpark1xAttention._fused_kv_store"
-MODEL_PIN = (
-    "sglang/srt/models/muse_spark.py",
-    (
-        "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
-        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+# What this part hooks, mirrors or calls; nvfp4_kv's pins cover the rest of the backend and pools. The store mirror reads
+# through the pool's layer router, so revisions without one (306ccf6 and earlier) are no longer accepted.
+PINS = {
+    "sglang/srt/models/muse_spark.py": (
+        bed.Functions(
+            {
+                "MuseSpark1xAttention.__init__": "6c44d00fb22adfb0",
+                "MuseSpark1xAttention._fused_kv_store": "a2a4beb31ffa8901",
+            }
+        ),
     ),
-)
+    # the hooked calls and the helpers that read the attributes _fp8_view sets
+    "sglang/srt/layers/attention/trtllm_mha_backend.py": (
+        bed.Functions(
+            {
+                "TRTLLMHAAttnBackend.__init__": "70a9364ba6b6c920",
+                "TRTLLMHAAttnBackend.forward_extend": "9ddde6d7d3f6d4be",
+                "TRTLLMHAAttnBackend.forward_decode": "ee12be545624d748",
+                "TRTLLMHAAttnBackend._forward_extend_uses_native_fp4": "2ca6caa1239a837a",
+                "TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
+                "TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": "208190898701e7b0",
+                "TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",
+                "TRTLLMHAAttnBackend._get_layer_cache_loc": "9253a58925623e0c",
+            }
+        ),
+    ),
+    "sglang/srt/layers/attention/flashinfer_backend.py": (
+        bed.Functions({"FlashInferAttnBackend._kv_write_scales": "54ae36c995e9ae24"}),
+    ),
+    "sglang/srt/mem_cache/memory_pool.py": (
+        bed.Functions(
+            {
+                "MHATokenToKVPool.__init__": "19352e82644dfacc",
+                "KVCache.layer_router": "a2951e1240c315b6",
+            }
+        ),
+    ),
+}
 
 _FLAGS = (
     "prefill_uses_native_fp4",
@@ -166,11 +200,14 @@ def _store_around(original, self, forward_batch, *args, **kwargs):
         get_attn_backend,
         get_token_to_kv_pool,
     )
+    from sglang.srt.runtime_context import get_memory
 
     pool = get_token_to_kv_pool()
     sub = _fp8_sub_pool_of(pool, self.attn.layer_id)
     if sub is None:
         return original(self, forward_batch, *args, **kwargs)
+    if get_memory().enable_unified_memory:
+        return None
     backend = get_attn_backend()
     if not (
         isinstance(backend, TRTLLMHAAttnBackend)
@@ -187,8 +224,8 @@ def _store_around(original, self, forward_batch, *args, **kwargs):
     ):
         return None
     cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
-    k_cache = pool.get_key_buffer(self.layer_idx)
-    v_cache = pool.get_value_buffer(self.layer_idx)
+    k_cache = pool.layer_router.read(self.layer_idx).key()
+    v_cache = pool.layer_router.read(self.layer_idx).value()
     return (
         k_cache.view(k_cache.shape[0], -1),
         v_cache.view(v_cache.shape[0], -1),
@@ -201,8 +238,9 @@ def install() -> bool:
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    if not bed.pinned(*MODEL_PIN):
-        raise RuntimeError(f"{MODEL_PIN[0]} does not match its pin")
+    for rel, sha in PINS.items():
+        if not bed.pinned(rel, sha):
+            raise RuntimeError(f"{rel} does not match its pin")
     HookRegistry.register(TARGET_EXTEND, _extend_around, HookType.AROUND)
     HookRegistry.register(TARGET_DECODE, _decode_around, HookType.AROUND)
     HookRegistry.register(TARGET_STORE, _store_around, HookType.AROUND)

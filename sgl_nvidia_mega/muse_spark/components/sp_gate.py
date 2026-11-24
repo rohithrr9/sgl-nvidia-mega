@@ -61,25 +61,59 @@ SGLANG_PINS = {
     "sglang/srt/layers/layernorm_sp.py": (
         "ffdde97e6282103614d7cec20cc29fb3cf0157d051778e315b03a99bb8e81090",
         "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        # 3117f58 + #48948 (runs_sp takes the pass's token count) and 306ccf6
+        bed.Functions(
+            {
+                "runs_sp": ("6049807aa2400a43", "edeeba97241e845a"),
+                "maybe_exit_gather": ("e521d36eb98221ab", "29442089ca428eeb"),
+                "sp_entry_scatter": ("0816745cf77a5a21", "5bf03d3be31403ec"),
+                "sp_exit_gather": ("9cb382ace8f09f64", "a6086ff23ce81e69"),
+            }
+        ),
     ),
     # decoder SP entry (MuseSpark1xModel._forward), aux-tap gather and omni exit (MuseSpark1xForCausalLM._forward)
     "sglang/srt/models/muse_spark.py": (
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # the same two entry points in the source (the shim's _forward is the source's forward), 3117f58 + #48948
+        # and 306ccf6
+        bed.Functions(
+            {
+                "MuseSpark1xModel.forward": ("5a17d5920ad718b9", "82b3cba268aa1fdc"),
+                "MuseSparkTextForCausalLM.forward": (
+                    "72ade900ba1d1069",
+                    "e6e491b6b400c513",
+                ),
+            }
+        ),
     ),
     # LM-head exit gather (maybe_exit_gather with the forward mode)
     "sglang/srt/layers/logits_processor.py": (
         "ecc0318937eee486414f6ae7165f2d1de17c01794a25aae83a99af61cbb0e3d0",
         "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+        bed.Functions(
+            {"LogitsProcessor.forward": ("f1604e7bcf4cd8fa", "825a8fa668abeec6")}
+        ),
     ),
     # layer-boundary SP entry (sp_active from runs_sp)
     "sglang/srt/layers/layer_boundary/stage.py": (
         "c496ad878963c724c0a46db4489798a139c34e5c0b22a273e4af71f3ae45e276",
         "782bbc56750c38b8e9cd1fd6adbb315e33289a1fa135a0720b1c830c274aec7f",
+        bed.Functions(
+            {"StageBoundary._select": ("a1ab3bafed24a06c", "f317ed475a7672cf")}
+        ),
     ),
     # participant linears read sp_active
-    "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+    "sglang/srt/layers/linear.py": (
+        "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+        bed.Functions(
+            {
+                "ColumnParallelLinear.forward": "7538aefbf1cabf51",
+                "RowParallelLinear.forward": ("1d5fb1eabbb87ec4", "b291a3c452e428a5"),
+            }
+        ),
+    ),
 }
 
 _lock = threading.Lock()
@@ -150,8 +184,9 @@ def _gate_usable() -> bool:
     return _state["checked"]
 
 
-def _runs_sp(forward_mode) -> bool:
-    if not _state["orig_runs_sp"](forward_mode):
+def _runs_sp(forward_mode, *args, **kwargs) -> bool:
+    # 3117f58 + #48948 passes the pass's token count (runs_sp(forward_mode, num_tokens)); 306ccf6 only the mode
+    if not _state["orig_runs_sp"](forward_mode, *args, **kwargs):
         return False
     if not _gate_usable():
         return True
@@ -195,7 +230,13 @@ def install(min_tokens: int) -> None:
             layernorm_sp.runs_sp = _runs_sp
             # The outer causal LM runs eagerly on every pass, also when the decoder replays a prefill graph; the
             # decoder entry runs at graph capture (bucket-sized dummy batch) and on eager passes.
-            for cls in (muse_spark.MuseSpark1xForCausalLM, muse_spark.MuseSpark1xModel):
+            # (MuseSpark1xForCausalLM is sgl_shims' alias of MuseSparkTextForCausalLM, absent where the shims are not
+            # installed, e.g. 3117f58 + #48948.)
+            causal_lm = (
+                getattr(muse_spark, "MuseSpark1xForCausalLM", None)
+                or muse_spark.MuseSparkTextForCausalLM
+            )
+            for cls in (causal_lm, muse_spark.MuseSpark1xModel):
                 if not getattr(cls.forward, "__wrapped_by_sp_gate__", False):
                     cls.forward = _wrap_entry(cls.forward)
 

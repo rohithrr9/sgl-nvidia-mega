@@ -15,7 +15,8 @@
  * limitations under the License.
  */
 // Derived from FlashInfer (https://github.com/flashinfer-ai/flashinfer) csrc/fp4_kv_quantization.cu as shipped in
-// flashinfer-python 0.7.1 (flashinfer/data/csrc/fp4_kv_quantization.cu); see ../include/LICENSE.flashinfer.
+// flashinfer-python 0.7.1, with the output-scale guard of 0.7.4 (flashinfer/data/csrc/fp4_kv_quantization.cu); see
+// ../include/LICENSE.flashinfer.
 // Modified by NVIDIA: FlashInfer's per-block NVFP4 quantization is kept (the rcp.approx, bf16 abs / max and E2M1
 // packing helpers and the E4M3 block-scale and output-scale arithmetic of quantize_fp16_to_e2m1_with_scaling); the
 // kernel around it quantizes one layer's K and V rows read from strided views and scatters the packed rows and block
@@ -29,9 +30,11 @@
 // The stock path runs FlashInfer's nvfp4_kv_quantize for K, a copy (.contiguous()) and the same quantization for V,
 // then SGLang's scatter kernel: four launches per layer. The per-block arithmetic here is the one of FlashInfer's
 // fp4_kv_quantization.cu (Apache-2.0): amax of the 16 values, sf = rcp(gs) * (amax * rcp(6)) rounded to E4M3,
-// out_scale = rcp(sf * gs) (0 when amax == 0), values * out_scale rounded to E2M1 (rcp = rcp.approx.ftz.f32), and the
-// module is compiled with -use_fast_math as FlashInfer compiles its kernel, so the bytes written are the stock bytes
-// (checked bit for bit in tests/test_nvfp4_kv_store.py).
+// out_scale = rcp(sf * gs) (0 when the rounded sf == 0, the guard of FlashInfer 0.7.4; 0.7.1 / 0.7.2 tested amax == 0
+// instead, which writes other E2M1 codes only in blocks whose scale rounds to 0, so both dequantize those blocks to 0),
+// values * out_scale rounded to E2M1 (rcp = rcp.approx.ftz.f32), and the module is compiled with -use_fast_math as
+// FlashInfer compiles its kernel, so the bytes written are the stock bytes (checked bit for bit in
+// tests/test_nvfp4_kv_store.py).
 //
 // Work split: one thread per 8 values (16 input bytes -> 4 output bytes); the two threads of a 16-value block are
 // neighbouring lanes and exchange their maxima with one shuffle (as the stock kernel does). The even thread writes the
@@ -139,7 +142,7 @@ __global__ void __launch_bounds__(kThreads) nvfp4_kv_store_kernel(const Params p
   float sf = rcp_approx_ftz(gs) * (amax * rcp_approx_ftz(6.0f));
   const __nv_fp8_e4m3 sf8 = __nv_fp8_e4m3(sf);
   sf = static_cast<float>(sf8);
-  const float out_scale = amax != 0 ? rcp_approx_ftz(sf * gs) : 0.0f;
+  const float out_scale = sf != 0 ? rcp_approx_ftz(sf * gs) : 0.0f;
   float2 f[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {

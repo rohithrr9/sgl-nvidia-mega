@@ -53,8 +53,28 @@ TARGET = (
 ENV_BLOCK = "MUSE_VR_GRAPH_META_PAR_BLOCK"
 
 PINS = {
-    "sglang/kernels/ops/attention/trtllm_mha_graph_metadata.py": "6a5014672e47157e315f3a99b5a34cac37b784f8cf901a47ad99c4e70a9f2321",
-    "sglang/srt/layers/attention/trtllm_mha_backend.py": "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+    "sglang/kernels/ops/attention/trtllm_mha_graph_metadata.py": (
+        "6a5014672e47157e315f3a99b5a34cac37b784f8cf901a47ad99c4e70a9f2321",
+        # the mirrored kernel and its launcher
+        bed.Functions(
+            {
+                "update_trtllm_mha_graph_metadata_kernel": "0387962135d53635",
+                "update_trtllm_mha_graph_metadata": "521d612de31ec7d6",
+            }
+        ),
+    ),
+    "sglang/srt/layers/attention/trtllm_mha_backend.py": (
+        "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+        # the call site whose keyword form the hook reproduces
+        bed.Functions(
+            {
+                "TRTLLMHAAttnBackend._apply_cuda_graph_metadata": (
+                    "d95fbc8a808ed9d5",
+                    "22975bf5063256fd",
+                ),
+            }
+        ),
+    ),
 }
 
 _KEYS = frozenset(

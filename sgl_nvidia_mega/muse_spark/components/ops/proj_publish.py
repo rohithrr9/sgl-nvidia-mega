@@ -6,9 +6,10 @@ For a projection ``y = x @ W.T`` whose input ``x`` is identical on every tensor-
 attention boundary, the unpooler after the expert all-reduce), each rank multiplies only its contiguous ``N / world``
 block of ``W`` rows. The GEMM (``opp_tgv_gemm`` push_mode 7, SGLang's TGV kernel) stores each output vector, through
 the multicast address of the tensor-parallel push workspace, into this rank's block of a gather slot in every rank's
-copy: the slot layout ``[source rank][M][N / world]``, the phase halves and the empty-marker rule (+0.0 in either 16-bit
-half = not arrived; an exact +0.0 half is sent as -0.0) are those of SGLang's own all-gather (``gemm_ag`` /
-``all_gather_norm_residual``). The consumers take every vector from the local copy, reset it, and run the arithmetic of
+copy: the slot layout ``[source rank][M][N / world]`` and the phase halves are those of SGLang's own all-gather
+(``gemm_ag`` / ``all_gather_norm_residual``); the empty-marker rule (+0.0 in either 16-bit half = not arrived; an exact
++0.0 half is sent as -0.0) is that all-gather's rule at 306ccf6 (from 3117f58 SGLang marks per 32-bit word, which a
+payload remapped per half also satisfies). The consumers take every vector from the local copy, reset it, and run the arithmetic of
 the stock kernel they replace (``csrc/proj_publish.cuh``):
 
 - ``pub_ag_norm``: the FFN boundary of SGLang's ``all_gather_norm_residual`` without its own push of the local slice;
@@ -18,7 +19,8 @@ A producer and its consumer form one use of the push plane: the producer reads t
 never advances it; the consumer, launched next on the same stream, reads the same phase and advances it at its end, as
 every user of the plane does. Results equal the stock pair "replicated GEMM + stock kernel" up to (a) the GEMM's
 summation order where the slice GEMM and the replicated GEMM differ, and (b) the sign of exact-zero projection outputs
-(the empty-marker remap), which SGLang's all-gather path shares.
+(the empty-marker remap), which SGLang's all-gather path shares at 306ccf6 (from 3117f58 it remaps only an all-zero
+32-bit word).
 """
 
 from __future__ import annotations
@@ -38,9 +40,11 @@ SGLANG_READS = {
         "load_jit",
         "make_cpp_args",
     ),
-    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "CustomAllReduceV2",
-    ),
+}
+# SGLang's symmetric-workspace lease (nightly 3117f58 and later); on an older SGLang the component's source pins
+# fail first and it steps aside, so the module is never reached there
+SGLANG_OPTIONAL_READS = {
+    "srt/distributed/device_communicators/symm_workspace.py": ("WorkspaceLease",),
 }
 
 
@@ -110,25 +114,24 @@ def _quant_module(hidden: int, world: int, threads: int):
 
 
 def step_aside_reason(comm, num_tokens: int, n_full: int, k: int) -> Optional[str]:
-    """None when a publish of an [num_tokens, k] x [n_full, k]^T projection can run on ``comm``; else the reason."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    """None when a publish of an [num_tokens, k] x [n_full, k]^T projection can run on ``comm`` (the Muse Spark
+    collectives' lease on the tensor-parallel symmetric workspace, ``muse_workspace()``); else the reason."""
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
 
-    if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
-        return "no custom all-reduce"
+    if not isinstance(comm, WorkspaceLease):
+        return "no symmetric workspace"
     if comm.world_size not in _WORLDS:
         return "world"
-    if (
-        not getattr(comm, "has_multicast", False)
-        or getattr(comm, "_push_multicast_ptr", None) is None
-    ):
+    if not comm.has_multicast:
         return "no multicast"
     if num_tokens <= 0:
         return "rows"
     if n_full % (comm.world_size * 128) or k % 128:
         return "shape"
-    if num_tokens * n_full * 2 > comm.max_push_size:
+    # the slot this lease asked for, as SGLang's own all-gathers bound it (the workspace's slot is at least this)
+    if num_tokens * n_full * 2 > comm.request.push_slot_bytes:
         return "push slot size"
     return None
 
@@ -185,7 +188,8 @@ def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
     """(dummy output [m, n_slice], int64 argument block) of a push_mode 7 GEMM, cached per (device, m, n_slice, plane)."""
     from .. import opp_tgv_gemm as g
 
-    key = (device.index or 0, m, n_slice, int(comm._push_multicast_ptr))
+    push_mc = int(comm.data.push_mc)  # multicast VA of the push slots (has_multicast)
+    key = (device.index or 0, m, n_slice, push_mc)
     hit = _meta.get(key)
     if hit is None:
         if torch.cuda.is_current_stream_capturing():
@@ -195,15 +199,15 @@ def _publish_meta(comm, m: int, n_slice: int, device: torch.device):
         w = comm.world_size
         out = _carrier(device, n_slice, m)  # shape carrier only (no plain stores)
         meta = g.make_push_meta(
-            counter_addr=comm._push_counter.data_ptr(),
-            phase_stride=w * comm.max_push_size,
+            # the plane's phase word is one u64 EpochCounter: the phase is bit 0 of its high (second) 32-bit half,
+            # which the GEMM reads as a b32 word (& 1)
+            counter_addr=comm.control.epoch.data_ptr() + 4,
+            phase_stride=w * comm.capacity.push_slot_bytes,
             rank=comm.rank,
             rows=m,
             chunk_rows=0,
             out=out,
-            peer_slot_bases=[
-                int(comm._push_multicast_ptr) + comm.rank * m * n_slice * 2
-            ],
+            peer_slot_bases=[push_mc + comm.rank * m * n_slice * 2],
         )
         hit = (out, meta)
         _meta[key] = hit
@@ -269,7 +273,7 @@ def pub_ag_norm(
         alpha is not None,
     )
     module.run(
-        comm.obj,
+        comm.get_communicator(),
         stream,
         output,
         new_stream,
@@ -303,5 +307,13 @@ def pub_norm_fp4_quant(
     sf = torch.empty(num_tokens, hidden // 16, dtype=torch.uint8, device=device)
     pts = torch.empty(num_tokens, dtype=torch.float32, device=device)
     module = _quant_module(hidden, comm.world_size, _num_threads(hidden))
-    module.run(comm.obj, weight, fp4, sf, pts, float(eps), float(global_scale_inv))
+    module.run(
+        comm.get_communicator(),
+        weight,
+        fp4,
+        sf,
+        pts,
+        float(eps),
+        float(global_scale_inv),
+    )
     return fp4, sf, pts

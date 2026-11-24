@@ -3,13 +3,13 @@
 // Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Sources: SGLang python/sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh (nvlink_pull_kernel and the pull half of
-// NVLinkComm) and python/sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh (McBarrier) at revision
-// a55ab7d.
+// NVLinkComm) and python/sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh (McBarrier and
+// Semaphore::take_*) at revision 3117f58.
 // Modified by NVIDIA: the two barrier waits of the pull kernel (entry and exit) are bounded. Each wait polls the same
 // semaphore with the same load (scope and semantics unchanged) and counts its unsuccessful polls; at the caller's
 // limit the kernel prints one diagnostic line and executes a trap, which the host sees as a CUDA error, instead of
-// polling forever. The data path, the launch shape (grid, block, barrier windows) and every load, store, reduction
-// and fence of the original are kept as they are; only the all-gather entry point is exported.
+// polling forever. The data path, the launch shape (grid, block, one semaphore per block) and every load, store,
+// reduction and fence of the original are kept as they are; only the all-gather entry point is exported.
 
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
@@ -31,6 +31,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 
 namespace sglang {
 
@@ -84,51 +85,62 @@ __device__ __noinline__ void barrier_wait_exceeded(
   __trap();
 }
 
-/// SGLang's McBarrier (same window reservation, same signal and the same poll), with each wait bounded to
-/// `max_polls` unsuccessful polls. One thread drives the whole barrier.
+// Semaphore keeps its two arrival counters private: u32 relaxed arrivals at byte 0, u32 release arrivals at byte 4
+// (communicator.cuh at the pinned revision). The bounded take below reads them through this layout.
+static_assert(std::is_standard_layout_v<Semaphore> && sizeof(Semaphore) == 128, "Semaphore layout changed");
+
+/// Semaphore::take_acquire / take_relaxed (take `n` arrivals, then wait for the balance to return to >= 0), with the
+/// wait bounded to `max_polls` unsuccessful polls. While it waits, `n + balance` of the `n` arrivals have landed.
+template <bool kAcquire>
+SGL_DEVICE void bounded_take(Semaphore* semaphore, uint32_t n, uint32_t max_polls, uint32_t rank, uint32_t barrier) {
+  const auto counter = reinterpret_cast<uint32_t*>(semaphore) + (kAcquire ? 1 : 0);
+  uint32_t polls = 0;
+  uint32_t balance;
+  if constexpr (kAcquire) {
+    if (static_cast<int32_t>(device::ptx::atomic_add_acquire_sys(counter, -n) - n) >= 0) return;
+    while (static_cast<int32_t>(balance = device::ptx::load_acquire_sys(counter)) < 0) {
+      if (++polls == max_polls) [[unlikely]]
+        barrier_wait_exceeded(rank, barrier, n + balance, n, polls);
+    }
+  } else {
+    if (static_cast<int32_t>(device::ptx::atomic_add_relaxed_sys(counter, -n) - n) >= 0) return;
+    while (static_cast<int32_t>(balance = device::ptx::load_relaxed_sys(counter)) < 0) {
+      if (++polls == max_polls) [[unlikely]]
+        barrier_wait_exceeded(rank, barrier, n + balance, n, polls);
+    }
+  }
+}
+
+/// SGLang's McBarrier (the same multicast arrival, take and poll), with each wait bounded to `max_polls` unsuccessful
+/// polls. One thread drives the whole barrier; stateless, like SGLang's.
 struct BoundedMcBarrier {
  public:
-  SGL_DEVICE BoundedMcBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t num_arrives)
-      : m_counter(0), m_world_size(world_size), m_local(local), m_mc(mc) {
-    if (threadIdx.x == 0) {
-      m_counter = local[blockIdx.x].counter_ptr()->inc(num_arrives * world_size);
-    }
-  }
+  SGL_DEVICE BoundedMcBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t idx = blockIdx.x)
+      : m_world_size(world_size), m_idx(idx), m_local(local), m_mc(mc) {}
 
   template <bool kNeedFence>
-  SGL_DEVICE void arrive(uint32_t n, uint32_t max_polls, uint32_t rank) const {
+  SGL_DEVICE void arrive(uint32_t barrier, uint32_t max_polls, uint32_t rank) const {
     if (threadIdx.x != 0) return;
-    const auto window = m_counter + n * m_world_size;
-    const auto bx = blockIdx.x;
-    const auto semaphore = &m_local[bx];
-    const auto mc_semaphore = &m_mc[bx];
-    uint32_t polls = 0;
     if constexpr (kNeedFence) {
-      mc_semaphore->put_release_multicast();
-      while (semaphore->get_acquire() - window < m_world_size) {
-        if (++polls == max_polls) [[unlikely]]
-          barrier_wait_exceeded(rank, n, semaphore->get_relaxed() - window, m_world_size, polls);
-      }
+      m_mc[m_idx].put_release_multicast();
+      bounded_take<true>(&m_local[m_idx], m_world_size, max_polls, rank, barrier);
     } else {
-      mc_semaphore->put_relaxed_multicast();
-      while (semaphore->get_relaxed() - window < m_world_size) {
-        if (++polls == max_polls) [[unlikely]]
-          barrier_wait_exceeded(rank, n, semaphore->get_relaxed() - window, m_world_size, polls);
-      }
+      m_mc[m_idx].put_relaxed_multicast();
+      bounded_take<false>(&m_local[m_idx], m_world_size, max_polls, rank, barrier);
     }
   }
 
-  SGL_DEVICE void arrive_relaxed(uint32_t n, uint32_t max_polls, uint32_t rank) const {
-    return this->arrive<false>(n, max_polls, rank);
+  SGL_DEVICE void arrive_relaxed(uint32_t barrier, uint32_t max_polls, uint32_t rank) const {
+    return this->arrive<false>(barrier, max_polls, rank);
   }
 
-  SGL_DEVICE void arrive_rel_acq(uint32_t n, uint32_t max_polls, uint32_t rank) const {
-    return this->arrive<true>(n, max_polls, rank);
+  SGL_DEVICE void arrive_rel_acq(uint32_t barrier, uint32_t max_polls, uint32_t rank) const {
+    return this->arrive<true>(barrier, max_polls, rank);
   }
 
  private:
-  uint32_t m_counter;  // window base; meaningful in thread 0, the sole poller
   uint32_t m_world_size;
+  uint32_t m_idx;
   Semaphore* m_local;
   Semaphore* m_mc;
 };
@@ -148,8 +160,8 @@ MUSE_VR_PULL_KERNEL void muse_vr_pull_bounded_kernel(const __grid_constant__ Bou
   const auto num_warps = gridDim.x * (kPullCTASize / kWarpThreads);
 
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = BoundedMcBarrier{params.sem_local, params.sem_mc, params.world_size, 2};
-  barrier.arrive_relaxed(/*n=*/0, params.max_polls, params.rank);
+  const auto barrier = BoundedMcBarrier{params.sem_local, params.sem_mc, params.world_size};
+  barrier.arrive_relaxed(/*barrier=*/0, params.max_polls, params.rank);
   __syncthreads();
 
   const auto num_whole_chunks = params.num_vecs / kNumWarpVecs;
@@ -215,9 +227,9 @@ MUSE_VR_PULL_KERNEL void muse_vr_pull_bounded_kernel(const __grid_constant__ Bou
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if constexpr (kPrim & Primitive::AG) {
-    barrier.arrive_rel_acq(/*n=*/1, params.max_polls, params.rank);
+    barrier.arrive_rel_acq(/*barrier=*/1, params.max_polls, params.rank);
   } else {  // no store multimem, only local store
-    barrier.arrive_relaxed(/*n=*/1, params.max_polls, params.rank);
+    barrier.arrive_relaxed(/*barrier=*/1, params.max_polls, params.rank);
   }
 }
 
@@ -271,7 +283,7 @@ struct MuseVrPullBounded {
     auto device_ = SymbolicDevice{};
     auto dtype_ = SymbolicDType{};
     if constexpr (!std::is_same_v<T, void>) dtype_.set_options<T>();
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({-1, D})  //
         .with_dtype(dtype_)
         .with_device(device_)
@@ -321,15 +333,15 @@ struct MuseVrPullBounded {
     } else if constexpr (kPrim == Primitive::RS) {
       CHECK_HOST(out_tokens == routing.num_rank_tokens && in_mc_ptr != 0);
       in_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = pull.num_blocks;  // use all the blocks for RS
+      if (num_blocks_hint == 0) num_blocks_hint = pull.default_blocks;  // use all the blocks for RS
     } else {
       static_assert(kPrim == Primitive::AG);
       CHECK_HOST(num_tokens == routing.num_rank_tokens && out_mc_ptr != 0);
       out_mc_ptr += prefix_bytes;
       if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(128u, kPullUnroll * world_size);
     }
-    /// NOTE: hard limit upper bound is `pull.num_blocks`
-    num_blocks_hint = std::min(num_blocks_hint, pull.num_blocks);
+    /// NOTE: hard limit upper bound is `pull.capacity`
+    num_blocks_hint = std::min(num_blocks_hint, pull.capacity);
 
     // Every pull primitive works on this rank's shard, so a full-length
     // residual is sliced onto it.

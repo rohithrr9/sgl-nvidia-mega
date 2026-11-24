@@ -63,11 +63,28 @@ PINS = {
         "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
         "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
         "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+        # the last layer's tail (post-feedforward norm, residual gate) and the model's cast and final norm
+        bed.Functions(
+            {
+                "MuseSpark1xModel.forward": ("5a17d5920ad718b9", "82b3cba268aa1fdc"),
+                "MuseSpark1xModel.__init__": ("494fbc30068c6846", "078c27dc5123bc97"),
+                "MuseSpark1xDecoderLayer.forward": (
+                    "51e40503e316c464",
+                    "16062a0b89c4ee50",
+                ),
+                "MuseSpark1xDecoderLayer.__init__": "e8d853ff24c4ff47",
+            }
+        ),
     ),
     "sglang/srt/layers/muse_spark_layers.py": "930e66da715bae576ae681f2dfd8353a36a9ca469a229d88fa3f77bc1e74cef0",
     "sglang/srt/layers/layernorm_sp.py": (
         "ffdde97e6282103614d7cec20cc29fb3cf0157d051778e315b03a99bb8e81090",
         "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        bed.Functions(
+            {
+                "runs_sp": ("6049807aa2400a43", "edeeba97241e845a"),
+            }
+        ),
     ),
 }
 # PyTorch builds whose row-wise RMSNorm summation order the bitwise test matched (torch.version.git_version), with the

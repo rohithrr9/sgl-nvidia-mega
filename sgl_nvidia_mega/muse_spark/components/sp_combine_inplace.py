@@ -9,15 +9,18 @@ weighted top-k sum) writes a new ``[ep_size * max_tokens, hidden]`` tensor, and 
 kernel that copies that tensor, token by token, into the rank's own workspace region the peers read from. FlashInfer
 supports a zero-copy form of the same combine: the payload is a view of that workspace region
 (``get_combine_payload_tensor_in_workspace``) and ``combine(payload_in_workspace=True)`` skips the copy (its
-preparation kernel then only advances the round counter). SGLang uses that form for another expert runner only.
+preparation kernel then only advances the round counter). FlashInfer 0.7.4 (``flashinfer.moe_ep``) hands out the view
+with ``get_combine_input_buffer`` and its ``combine`` recognizes the view by its address. SGLang uses that form for
+another expert runner only.
 
 This component makes the Muse Spark expert finalize write its output directly into the workspace view (the same
 fused finalize kernel, the same arithmetic, only a different destination address) and lets the sequence-parallel
 dispatcher run the zero-copy combine. The peers read the same bytes as before, so the combined output is bitwise
 identical; the per-token copy of the payload is removed. The order of the payload writes and the combine's
 readiness signal is unchanged: the payload is complete when an earlier kernel on the stream (the finalize, before:
-the copy kernel) has finished. FlashInfer checks that a workspace payload is exactly the workspace view and fails
-loudly otherwise.
+the copy kernel) has finished. FlashInfer 0.7.1 / 0.7.2 check that a workspace payload is exactly the workspace view
+and fail loudly otherwise; 0.7.4 stages any other payload with the copy, so there the loud check is this component's own
+(the expert finalize must return the workspace view).
 
 Opt in with ``MUSE_VR_SP_COMBINE_INPLACE=1`` (only meaningful with ``--enable-layernorm-sp``). Engagement is guarded
 by sha256 pins on the SGLang dispatcher and expert files and the FlashInfer all-to-all files it relies on.
@@ -53,26 +56,88 @@ logger = logging.getLogger("muse_vr_plugin")
 NAME = "sp_combine_inplace"
 
 SGLANG_PINS = {
-    # FlashinferDispatcher: SP-prefill instance, payload_in_workspace in dispatch / combine
-    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py": "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
+    # FlashinferDispatcher: SP-prefill instance, payload_in_workspace in dispatch / combine (newer SGLang passes no
+    # flag to combine: FlashInfer's combine recognizes the workspace payload by its address)
+    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py": (
+        "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
+        bed.Functions(
+            {
+                "FlashinferDispatcher.__init__": (
+                    "09371915b1301975",
+                    "fcc8ee39ae3319fe",
+                ),
+                "FlashinferDispatcher.dispatch": (
+                    "e1eed8fdb4ea3433",
+                    "74e35916f73b9b18",
+                ),
+                "FlashinferDispatcher.combine": (
+                    "6f5ba7281d294200",
+                    "a546e68f329486cb",
+                ),
+            }
+        ),
+    ),
     # NVFP4 experts: forward_dispatched / _finalize_deferred_output (reimplemented below with a destination)
     "sglang/srt/layers/muse_spark_fp4_moe.py": (
         "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
         "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+        bed.Functions(
+            {
+                "MuseSpark1xFp4Experts.forward_dispatched": "55ee763b2d00ed84",
+                "MuseSpark1xFp4Experts._finalize_deferred_output": "243e920761c83e15",
+                "MuseSpark1xFp4Experts.set_post_expert_norm": "d05de6a65cd26d00",
+                "finalize_with_post_expert_norm": "a3ee37c3b9b8b7cf",
+            }
+        ),
     ),
     # BF16 experts: forward_dispatched / _finalize_deferred_output (reimplemented below with a destination)
     "sglang/srt/layers/muse_spark_bf16_moe.py": (
         "687680077a7542cb1e2026d321c2f18a650fb56a654b50434acbf7be9c1aa6c5",
         "57ae1593b4496edfc658343d9ca039dead111484d78ec57ab3eaa14891f6afed",
+        bed.Functions(
+            {
+                "MuseSpark1xBf16Experts.forward_dispatched": "592f952a35e9e122",
+                "MuseSpark1xBf16Experts._finalize_deferred_output": "f02f932959a1e498",
+                "MuseSpark1xBf16Experts._build_finalize_op": "1fb1bf113d5e7830",
+            }
+        ),
     ),
 }
 FLASHINFER_PINS = {
+    # flashinfer.comm.MoeAlltoAll (FlashInfer 0.7.1 / 0.7.2; removed in 0.7.4)
     "flashinfer/comm/trtllm_moe_alltoall.py": (
         "8ae4a8e618e3956f864d0e012dced7ffbac55d6db18e61d05d4425c51375fda2",  # FlashInfer 0.7.1
         "21da7a12c1ef08e9c87fc5071e3fa1fafe9fbff04f9571ec683f339a01ea5b3c",  # FlashInfer 0.7.2
+        "absent",  # FlashInfer 0.7.4
     ),
-    "flashinfer/data/csrc/trtllm_moe_alltoall.cu": "d672681fb81aad57b780bde8ec8e07edfea58b65ab420f91c8df6aa79652f60f",
-    "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu": "195827d062cf18101b39491a6ecec4379d30f8e9e7e94e3992dda0420e67468f",
+    "flashinfer/data/csrc/trtllm_moe_alltoall.cu": (
+        "d672681fb81aad57b780bde8ec8e07edfea58b65ab420f91c8df6aa79652f60f",  # FlashInfer 0.7.1, 0.7.2
+        "absent",  # FlashInfer 0.7.4
+    ),
+    "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu": (
+        "195827d062cf18101b39491a6ecec4379d30f8e9e7e94e3992dda0420e67468f",  # FlashInfer 0.7.1, 0.7.2
+        "absent",  # FlashInfer 0.7.4
+    ),
+    # flashinfer.moe_ep NVLinkOneSidedAlltoAll (the all-to-all of SGLang's dispatcher on FlashInfer 0.7.4):
+    # get_combine_input_buffer, the combine that skips the staging copy for a payload at the combine-input address
+    # (fence path; the CFT and Lamport paths read the payload as a plain source), and the Lamport combine kernels
+    "flashinfer/moe_ep/backends/split/comm/nvlink_one_sided/communication.py": (
+        "absent",  # FlashInfer 0.7.1
+        "5d3075cf85b358dbdc92c94fe313e850dda84330a3620eba609b511b58f40803",  # FlashInfer 0.7.2 (SGLang 306ccf6: unused)
+        "20e66b0dfd8175df8230f4e3020cadbf3aa30f172f6d6582498ac0f27d22c7b8",  # FlashInfer 0.7.4
+    ),
+    "flashinfer/data/csrc/nvlink_one_sided_alltoall.cu": (
+        "absent",  # FlashInfer 0.7.1, 0.7.2
+        "eecf9de49a0aaa30569d2235571975a4789ba0536e796b2cbac53fe634148ec3",  # FlashInfer 0.7.4
+    ),
+    "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.cu": (
+        "absent",  # FlashInfer 0.7.1, 0.7.2
+        "92bce7109823ced9f436a7b96a5e7739d99d8e1158e406d95d23b4aea4447617",  # FlashInfer 0.7.4
+    ),
+    "flashinfer/data/include/flashinfer/comm/moe_alltoall_lamport.cuh": (
+        "absent",  # FlashInfer 0.7.1, 0.7.2
+        "c370c2874485af81693f55ffb5fa9c75e8b440a6aa35593ce55632d65ed40951",  # FlashInfer 0.7.4
+    ),
 }
 
 _state: dict = {"engaged": None}

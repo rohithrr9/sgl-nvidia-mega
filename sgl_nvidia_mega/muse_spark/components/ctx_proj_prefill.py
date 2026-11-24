@@ -32,7 +32,8 @@ as wide as the draft ``fc`` input, with the pass's token count at least the batc
 are the trailing padding of the forward's token dimension: the attention tensor-parallel alignment and the token
 buckets of the prefill pass; the consumer drops them before it projects, so both forms are compared and served on the
 leading extend rows), outside compilation, for an eligible draft (``DFlashDraftModel``'s own projection, an unquantized
-``torch.nn.Linear`` without bias). A pass with fewer rows than the extend count runs stock. Everything else calls
+``torch.nn.Linear`` without bias, not split across the ranks by output columns: ``SGLANG_OPT_DFLASH_TP_AUX_FC``). A pass
+with fewer rows than the extend count runs stock. Everything else calls
 the stock function. The marked forward is an eager extend: the
 exit hook raises if it finds itself inside CUDA-graph capture. The projection hook takes only the tensor the exit
 returned on that pass (or a leading-row view of it); any other projected-width tensor is refused loudly. Replicated
@@ -100,13 +101,74 @@ TARGET_PROJ = "sglang.srt.models.dflash.DFlashDraftModel.project_target_hidden"
 # Muse Spark wrapper (pack, then sp_exit_gather of the taps on an SP pass, then the logits processor), the SP exit
 # gather, the logits processor's full-capture store, the taps packer and the draft's projection.
 PINS = {
-    "sglang/srt/speculative/dflash_worker_v2.py": "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
-    "sglang/srt/managers/tp_worker.py": "3668a19cd3f6d5e923cd4620dd32e880dc9006411402b3c95c648566a8a377e3",
-    "sglang/srt/models/muse_spark.py": "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
-    "sglang/srt/layers/layernorm_sp.py": "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
-    "sglang/srt/layers/logits_processor.py": "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
-    "sglang/srt/layers/aux_hidden_states.py": "1c0b2055a5bfef2b06096ffac1fdea073cf471f0c48ccd3b4ab577118facae92",
-    "sglang/srt/models/dflash.py": "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+    "sglang/srt/speculative/dflash_worker_v2.py": (
+        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        bed.Functions(
+            {
+                "DFlashWorkerV2.__init__": "2ea464419194bb42",
+                "DFlashWorkerV2.forward_batch_generation": "d05d129bac415b00",
+                "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
+                "DFlashWorkerV2._take_ctx_projection": "b396aa19aff7b0b2",
+            }
+        ),
+    ),
+    "sglang/srt/managers/tp_worker.py": (
+        "3668a19cd3f6d5e923cd4620dd32e880dc9006411402b3c95c648566a8a377e3",
+        bed.Functions(
+            {
+                "TpModelWorker.forward_batch_generation": (
+                    "4a5058b84217aca3",
+                    "7cb73d5e6099d42a",
+                ),
+            }
+        ),
+    ),
+    "sglang/srt/models/muse_spark.py": (
+        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        bed.Functions(
+            {
+                "MuseSparkTextForCausalLM.forward": (
+                    "72ade900ba1d1069",
+                    "e6e491b6b400c513",
+                ),
+            }
+        ),
+    ),
+    "sglang/srt/layers/layernorm_sp.py": (
+        "bc814d983b945e5bdd41db436966eb4b3fee4c410bb1dcccfc98857d4b026bda",
+        bed.Functions(
+            {
+                "sp_exit_gather": ("9cb382ace8f09f64", "a6086ff23ce81e69"),
+                "all_gather_token_rows": "63880a67b34c2b6a",
+                "runs_sp": ("6049807aa2400a43", "edeeba97241e845a"),
+            }
+        ),
+    ),
+    "sglang/srt/layers/logits_processor.py": (
+        "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+        bed.Functions(
+            {
+                "LogitsProcessor._get_hidden_states_to_store": "40e5d8cdea2ec013",
+                "LogitsProcessor.forward": ("f1604e7bcf4cd8fa", "825a8fa668abeec6"),
+            }
+        ),
+    ),
+    "sglang/srt/layers/aux_hidden_states.py": (
+        "1c0b2055a5bfef2b06096ffac1fdea073cf471f0c48ccd3b4ab577118facae92",
+        bed.Functions({"pack_aux_hidden_states": "af75e18c07d8b18a"}),
+    ),
+    "sglang/srt/models/dflash.py": (
+        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "DFlashDraftModel.project_target_hidden": (
+                    "bb62f871776f9b86",
+                    "6f4ceab25185386d",
+                ),
+                "DFlashDraftModel.__init__": ("c08a07131e60cf38", "2f1ae1fc9a0322be"),
+            }
+        ),
+    ),
 }
 
 ENV_MIN_ROWS = "MUSE_VR_CTX_PROJ_PREFILL_SHARD_MIN_ROWS"
@@ -162,6 +224,8 @@ def _eligible_fc(dm) -> bool:
         type(fc) is torch.nn.Linear
         and fc.bias is None
         and not getattr(dm, "quantizable", True)
+        # a column slice of the fc whose projection all-reduces the slices (SGLANG_OPT_DFLASH_TP_AUX_FC)
+        and getattr(dm, "fc_tp_columns", None) is None
         and fc.weight.dtype == torch.bfloat16
         and fc.weight.is_contiguous()
     )

@@ -3,8 +3,9 @@
 """Component ``draft_head_lt`` (env ``MUSE_VR_DRAFT_HEAD_LT=1``, default off; needs ``gemm_lt`` engaged).
 
 The DFlash draft projects its hiddens onto the target head's vocabulary shard in ``models/dflash.py``
-``_project_candidate_logits``: for a dense head, ``torch.matmul(hidden.to(w.dtype), w[:num_org].T)``. That GEMM does not
-go through SGLang's bf16 dispatch, so ``gemm_lt``'s entries never reach it. For each entry of
+``_project_candidate_logits``: for a dense bf16 head, SGLang's ``bf16_gemm_dispatch(hidden, w[:num_org], None)`` when the
+bf16 GEMM backend is cutedsl or gemv, else ``torch.matmul(hidden.to(w.dtype), w[:num_org].T)``. This component's entries
+apply before that call (so independently of ``gemm_lt``'s dispatch entries). For each entry of
 ``MUSE_VR_DRAFT_HEAD_LT_RULES`` (``gemm_lt``'s entry form ``N x K : lo-hi : c0/.../c8``, separated by ``;``; default none,
 so nothing is taken without entries) this component runs that call through ``gemm_lt.checked_linear``: the entry's fixed
 cuBLASLt configuration behind the same first-use bit-for-bit check against the stock expression (a mismatch keeps that
@@ -25,19 +26,36 @@ from . import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
+    "srt/models/dflash.py": ("bf16_gemm_dispatch", "get_bf16_gemm_backend"),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
 
 
 NAME = "draft_head_lt"  # env MUSE_VR_DRAFT_HEAD_LT
 TARGET = "sglang.srt.models.dflash._project_candidate_logits"
+# its dense branch (the first-use check's reference, _stock_dense) runs SGLang's bf16 dispatch from 3117f58 + #48948 on;
+# the sha256 entries of the revisions with a plain torch.matmul there are gone
 PINS = {
     "sglang/srt/models/dflash.py": (
-        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
-        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions({"_project_candidate_logits": "7bb97346a98d9369"}),
     ),
 }
 _state: dict = {"rules": ()}
+
+
+def _stock_dense(hidden, w):
+    """The stock dense-head GEMM of ``_project_candidate_logits`` for bf16 CUDA operands (its ROCm branch never runs with
+    gemm_lt engaged)."""
+    import sglang.srt.models.dflash as d
+
+    backend = d.get_bf16_gemm_backend()
+    if (
+        (backend.is_cutedsl() or backend.is_gemv())
+        and hidden.is_cuda
+        and w.dtype == torch.bfloat16
+    ):
+        return d.bf16_gemm_dispatch(hidden, w, None)
+    return torch.matmul(hidden, w.T)
 
 
 def take(hidden, lm_head, num_org: int):
@@ -80,7 +98,7 @@ def take(hidden, lm_head, num_org: int):
             ]  # leading rows of a contiguous row-major weight: contiguous
             assert w.is_contiguous()
             out, why = gemm_lt.checked_linear(
-                hidden, w, cfg, lambda: torch.matmul(hidden, w.T)
+                hidden, w, cfg, lambda: _stock_dense(hidden, w)
             )
             if out is not None:
                 bed.count(NAME, f"lt_draft_head:{num_org}x{k}:m{m}")

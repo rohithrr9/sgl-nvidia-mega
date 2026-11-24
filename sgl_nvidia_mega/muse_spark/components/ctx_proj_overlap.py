@@ -16,6 +16,15 @@ returned (same storage, shape, strides, dtype); any other call computes as stock
 for the side work so the verify buffers are never rewritten while it still reads them. Nothing runs inside CUDA-graph
 capture.
 
+SGLang's own side-stream projection (``--speculative-dflash-overlap-ctx-projection``: ``_start_ctx_projection`` after
+the verify logits gather, ``_take_ctx_projection`` before the draft KV write) is skipped for a step this component has
+already launched (AROUND hook on ``_start_ctx_projection``, counted ``sglang overlap: superseded``): the worker's own
+``project_target_hidden`` call then takes this component's result on the worker's stream, so the projection still runs
+once per step and a shard-mode gather stays on the worker's stream. Steps this component leaves alone keep SGLang's
+overlap. The component also steps aside for a worker whose aux CUDA graph appends (and projects) a copy of the rows
+(``SGLANG_OPT_DFLASH_AUX_GRAPH``: ``stock:aux graph``) and for a draft whose ``fc`` is split across the ranks by output
+columns (``SGLANG_OPT_DFLASH_TP_AUX_FC``: its projection all-reduces; ``stock:tp-split fc``).
+
 ``MUSE_VR_CTX_PROJ_OVERLAP_SHARD=1`` (default off) splits the work across the tensor-parallel ranks for verify blocks of
 at most ``MUSE_VR_CTX_PROJ_OVERLAP_SHARD_MAX_ROWS`` rows (default 32): the side stream computes only this rank's
 slice of output columns (the same ``F.linear`` call on a row slice of the replicated weight), and the worker's call
@@ -30,13 +39,15 @@ rank takes the same path for a block, so the gather (a collective) is issued on 
 
 ``MUSE_VR_CTX_PROJ_OVERLAP_SIDE_GATHER=1`` (default off; shard mode only) also moves the gather and ``hidden_norm`` to the
 side stream, right after the slice GEMM, so the worker's call only waits for finished work. The gather cannot share the
-group's communicator there: its barrier windows live on that communicator's semaphores, which kernels on the worker's
-stream use at the same time (the verify records exchange, the all-reduces), and two streams reserving windows on one
-semaphore can interleave differently on different ranks. So the side gather runs on a communicator of its own (a second
-custom all-reduce instance over the same group: own symmetric workspace and semaphores, used by this call site only)
-with its own pull output. Same kernels on the same values: the result is bit-identical (tests/dist_ctx_proj_side_gather.py).
-The dedicated plane is created collectively at the first eligible call (every rank reaches it at the same call) and the
-ranks agree on its availability (minimum over the group); without it the call keeps the worker-stream gather.
+group's communicator there: its barriers live on that communicator's semaphores, which kernels on the worker's stream use
+at the same time (the verify records exchange, the all-reduces), and two streams using one semaphore can interleave
+differently on different ranks. So the side gather runs on a communicator of its own: SGLang 3117f58 + #48948 shares
+one symmetric workspace (semaphores and phase word included) among all consumers of a process group, keyed by its name,
+so the plane is a process group of its own over the same ranks (members only, the TP group's order) holding its own
+workspace, used by this call site only, with its own pull output. Same kernels on the same values: the result is
+bit-identical (tests/dist_ctx_proj_side_gather.py). The dedicated plane is created collectively at the first eligible
+call (eager: every rank reaches it at the same call, never inside a CUDA-graph capture) and the ranks agree on its
+availability (minimum over the group); without it the call keeps the worker-stream gather.
 
 ``MUSE_VR_CTX_PROJ_OVERLAP_SIDE_KV=1`` (default off; with the side gather) also runs the next consumer's batched K/V
 projection of those rows on the side stream: the worker writes the context K/V into the draft cache through
@@ -80,19 +91,24 @@ from . import bed, pull_bounded
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
-    "srt/distributed/*.py": ("get_tp_group",),
+    "srt/runtime_context.py": ("get_parallel",),
     "srt/distributed/device_communicators/vocab_gather.py": (
         "NVLinkVocabGather",
-        "make_vocab_gather",
         "NcclVocabGather",
-    ),
-    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "CustomAllReduceV2",
+        "make_vocab_gather",
     ),
     "srt/speculative/spec_utils.py": ("draft_tp_context",),
     "kernels/ops/speculative/fused_kv_materialize.py": ("_fused_norm_rope_stacked",),
     "srt/models/dflash.py": ("DFlashDraftModel",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+# the side gather's own symmetric workspace (SGLang 3117f58 + #48948; without it PINS_SIDE fails and the side
+# gather stays off)
+SGLANG_OPTIONAL_READS = {
+    "srt/distributed/device_communicators/symm_workspace.py": (
+        "WorkspaceRequest",
+        "request_symm_workspace",
+    ),
 }
 
 
@@ -102,22 +118,51 @@ NAME = "ctx_proj_overlap"  # env MUSE_VR_CTX_PROJ_OVERLAP
 TARGET_INIT = "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2.__init__"
 TARGET_FWD = "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation"
 TARGET_PROJ = "sglang.srt.models.dflash.DFlashDraftModel.project_target_hidden"
+TARGET_START = (
+    "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._start_ctx_projection"
+)
 
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) whose call order this
 # component relies on: the worker (verify forward, then sampling, then the projection of the same hidden tensor), the
-# target worker's forward signature, and the draft model's projection.
+# target worker's forward signature, and the draft model's projection. The worker's revisions before its draft placement
+# layout (draft_parallel_layout) are gone.
 PINS = {
     "sglang/srt/speculative/dflash_worker_v2.py": (
-        "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
-        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+        bed.Functions(
+            {
+                "DFlashWorkerV2.__init__": "2ea464419194bb42",
+                "DFlashWorkerV2.forward_batch_generation": "d05d129bac415b00",
+                "DFlashWorkerV2._start_ctx_projection": "7fe96c0b42f96ccc",
+                "DFlashWorkerV2._take_ctx_projection": "b396aa19aff7b0b2",
+                "DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc": "4c2eab09c6743c2d",
+                "DFlashWorkerV2._append_target_hidden_decode": "3e8ed52bddd81088",
+            }
+        ),
     ),
     "sglang/srt/managers/tp_worker.py": (
         "73b69f16193de495b4536b8e80a540de4dbd5d2c7f2f1f1696b8ebdf8f70d44d",
         "3668a19cd3f6d5e923cd4620dd32e880dc9006411402b3c95c648566a8a377e3",
+        bed.Functions(
+            {
+                "TpModelWorker.forward_batch_generation": (
+                    "4a5058b84217aca3",
+                    "7cb73d5e6099d42a",
+                ),
+            }
+        ),
     ),
     "sglang/srt/models/dflash.py": (
         "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
         "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        bed.Functions(
+            {
+                "DFlashDraftModel.project_target_hidden": (
+                    "bb62f871776f9b86",
+                    "6f4ceab25185386d",
+                ),
+                "DFlashDraftModel.__init__": ("c08a07131e60cf38", "2f1ae1fc9a0322be"),
+            }
+        ),
     ),
 }
 
@@ -132,13 +177,49 @@ _workers: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary
 _pending: dict = {}  # id(draft model) -> (key, result, event); result = projection, ("shard", local slice, group) or
 # ("side", normalized projection)
 _gathers: dict = {}
-_side_planes: dict = {}  # (id(group), width, dtype) -> (dedicated communicator, its gather plane) or None
-SIDE_PLANE_MAX_BYTES = (
-    1 << 20
-)  # workspace cap of the dedicated communicator (its push / pull buffers stay unused)
+_side_planes: dict = {}  # (id(group), width, dtype) -> (its workspace lease, its gather plane) or None
+_side_groups: dict = {}  # id(group) -> the side plane's process group (the same ranks)
+# the side plane's workspace request owner (SGLang's workspace log)
+SIDE_PLANE_OWNER = "muse_vr_ctx_proj_side"
+# SGLang 3117f58 + #48948 sources the side plane relies on (checked before its set-up; the side gather stays off
+# otherwise): a workspace per process-group name (so a group of its own gets semaphores of its own), its layout and
+# finalization, and the gather plane on a lease with its pull output on the TP group
+PINS_SIDE = {
+    "sglang/srt/distributed/device_communicators/symm_workspace.py": (
+        bed.Functions(
+            {
+                "request_symm_workspace": "4d774c362a8795c3",
+                "is_symm_workspace_supported": "82804668fa28058a",
+                "is_multicast_supported": "f39864903fd10bed",
+                "_Workspace.__init__": "6c19cda08d389e3a",
+                "_Workspace.finalize": "9a3ce97166fdb429",
+                "WorkspaceLease.get_communicator": "f5b7ae089508b316",
+                "WorkspaceLease._get_finalized": "1683ce8cc0b6478f",
+            }
+        ),
+    ),
+    "sglang/srt/distributed/device_communicators/vocab_gather.py": (
+        bed.Functions(
+            {
+                "_alloc_symm": "f286f72d32add96c",
+                "NVLinkVocabGather.__init__": "5bc7c1ae5ca58278",
+                "NVLinkVocabGather.comm": "7baf1eb66796a575",
+            }
+        ),
+    ),
+}
 TARGET_KV = "sglang.kernels.ops.speculative.fused_kv_materialize.FusedKVMaterializeHelper.materialize"
+# the stacked K/V weight is row-major (flat_kv_weight, multiplied as its transpose) from SGLang 3117f58 + #48948 on; the
+# revision with the transposed copy (flat_kv_weight_t) is gone
 PINS_KV = {
-    "sglang/kernels/ops/speculative/fused_kv_materialize.py": "b8dd985b7764d3212e9e3045b2daa5be0c481215346ab28f2513f8201e9cbfeb"
+    "sglang/kernels/ops/speculative/fused_kv_materialize.py": (
+        bed.Functions(
+            {
+                "FusedKVMaterializeHelper.materialize": "ef373ab24550022e",
+                "FusedKVMaterializeHelper.__init__": "afaaa88f276caf12",
+            }
+        ),
+    )
 }
 _kv_pre: dict = {}  # id(helper) -> (normalized rows handed to the worker, their K/V projection)
 _streams: dict = {}
@@ -234,9 +315,9 @@ def _shard_group_any(draft_model, hidden: torch.Tensor):
         or getattr(draft_model, "quantizable", True)
     ):
         return None
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
-    group = get_tp_group()
+    group = get_parallel().tp_group
     w = group.world_size
     if (
         w < 2
@@ -523,13 +604,33 @@ def _gather_columns_on(vg, group, local: torch.Tensor, site: str) -> torch.Tenso
 
 def _side_plane(group, n: int, dtype: torch.dtype, device: torch.device):
     """The gather plane on a communicator of its own (MUSE_VR_CTX_PROJ_OVERLAP_SIDE_GATHER), or None. Collective at the
-    first call for a (group, width, dtype); the ranks agree on the verdict (minimum over the group)."""
+    first call for a (group, width, dtype); the ranks agree on the verdict (minimum over the group).
+
+    SGLang 3117f58 + #48948 keys a symmetric workspace by its group's name and shares it among that group's consumers, so
+    the plane gets a process group of its own over the same ranks (members only, the TP group's order) and requests its
+    workspace there: the pull all-gather needs only the semaphores (plus multicast) and writes the pull output, a
+    collective allocation on the TP group as before. The workspace is finalized here, on every rank at this call."""
     key = (id(group), n, dtype)
     if key in _side_planes:
         p = _side_planes[key]
         return None if p is None else p[1]
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    if torch.cuda.is_current_stream_capturing():
+        # the set-up allocates symmetric memory (refused during capture); the first eligible launch is eager
+        return None
+    bad = [rel for rel, want in PINS_SIDE.items() if not bed.pinned(rel, want)]
+    if bad:  # the same files on every rank: the same verdict
+        _side_planes[key] = None
+        bed.report(
+            NAME + ":side_plane",
+            False,
+            world=group.world_size,
+            width=n,
+            reason="pins: " + ", ".join(bad),
+        )
+        return None
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_symm_workspace,
     )
     from sglang.srt.distributed.device_communicators.vocab_gather import (
         NcclVocabGather,
@@ -539,42 +640,54 @@ def _side_plane(group, n: int, dtype: torch.dtype, device: torch.device):
     pull_bounded.prepare(
         dtype
     )  # before the plane's collective set-up (MUSE_VR_PULL_BOUNDED)
-    ca = CustomAllReduceV2(
-        group=group.cpu_group, device=device, max_size=SIDE_PLANE_MAX_BYTES
+    pg = _side_groups.get(id(group))
+    if pg is None:
+        # only the group's members call it (local synchronization), each at this same call
+        pg = torch.distributed.new_group(
+            list(group.ranks),
+            backend="gloo",
+            use_local_synchronization=True,
+            group_desc=SIDE_PLANE_OWNER,
+        )
+        _side_groups[id(group)] = pg
+    # the pull all-gather barriers on the semaphores (the workspace holds at least one per SM); no push slot, no staging
+    lease = request_symm_workspace(
+        pg,
+        device,
+        WorkspaceRequest(owner=SIDE_PLANE_OWNER, semaphores=1),
     )
     usable = (
-        not ca.disabled
-        and bool(getattr(ca, "has_multicast", False))
-        and ca.obj.pull is not None
-        and ca.obj.push is not None
-        and ca.world_size == group.world_size
+        lease is not None
+        and lease.has_multicast
+        and lease.world_size == group.world_size
+        and lease.rank == group.rank_in_group
         and n % (128 // torch.finfo(dtype).bits) == 0
     )
     vg = None
-    # the pull output is a collective allocation: every rank makes it whenever the communicator was built
-    if not ca.disabled:
+    # the pull output is a collective allocation: every rank makes it whenever its group can host the workspace
+    if lease is not None:
         vg = NVLinkVocabGather(
-            ca_comm=ca,
+            lease=lease,
             group=group,
             local_width=n,
             dtype=dtype,
             symm_rows=_shard_max_rows(),
             fallback=NcclVocabGather(group),
         )
-        usable = usable and vg.pull_out is not None
+        # finalizes the workspace (collective on the plane's group) here rather than at a later first use
+        comm = vg.comm
+        usable = usable and vg.pull_out is not None and comm.pull is not None
     flag = torch.tensor([1 if usable else 0], dtype=torch.int32)
     torch.distributed.all_reduce(
         flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )
     usable = bool(flag.item())
-    _side_planes[key] = (ca, vg) if usable else None
+    _side_planes[key] = (lease, vg) if usable else None
     bed.report(NAME + ":side_plane", usable, world=group.world_size, width=n)
     return vg if usable else None
 
 
-def launch(
-    draft_model, hidden: torch.Tensor, owns_attention: bool, kv_helper=None
-) -> bool:
+def launch(draft_model, hidden: torch.Tensor, layout, kv_helper=None) -> bool:
     """Issue ``draft_model.project_target_hidden(hidden)`` (or, sharded, this rank's column slice of its GEMM) on the
     side stream; returns whether it was issued."""
     from sglang.srt.speculative.spec_utils import draft_tp_context
@@ -603,7 +716,7 @@ def launch(
         with (
             torch.cuda.stream(side),
             torch.inference_mode(),
-            draft_tp_context(owns_attention),
+            draft_tp_context(layout),
         ):
             if group is None:
                 result = draft_model.project_target_hidden(hidden)
@@ -673,11 +786,11 @@ def take(draft_model, target_hidden: torch.Tensor):
 
 def _side_kv_projection(helper, rows: torch.Tensor):
     """(helper, the batched K/V projection of ``rows``) issued on the current (side) stream, or None. The same call as
-    ``FusedKVMaterializeHelper.materialize`` makes: ``torch.mm(rows, flat_kv_weight_t, out=...)`` into a contiguous
+    ``FusedKVMaterializeHelper.materialize`` makes: ``torch.mm(rows, flat_kv_weight.t(), out=...)`` into a contiguous
     ``[rows, layers * 2 * kv_size]`` buffer."""
     if helper is None or not _state_kv["on"]:
         return None
-    w = getattr(helper, "flat_kv_weight_t", None)
+    w = getattr(helper, "flat_kv_weight", None)
     if (
         w is None
         or rows.dtype != w.dtype
@@ -691,7 +804,7 @@ def _side_kv_projection(helper, rows: torch.Tensor):
         dtype=rows.dtype,
         device=rows.device,
     )
-    torch.mm(rows, w, out=proj)
+    torch.mm(rows, w.t(), out=proj)
     return helper, proj
 
 
@@ -817,13 +930,32 @@ def _around_fwd(original, target_worker, *args, **kwargs):
     ):
         bed.count(NAME, "stock:verify output not eligible")
         return out
+    if getattr(worker, "_use_aux_graph", False):
+        # the worker's aux CUDA graph appends (and projects) a copy of the rows, on a stream of its own
+        bed.count(NAME, "stock:aux graph")
+        return out
+    if getattr(dm, "fc_tp_columns", None) is not None:
+        # fc split across the ranks by output columns: its projection all-reduces
+        bed.count(NAME, "stock:tp-split fc")
+        return out
     launch(
         dm,
         hidden,
-        bool(getattr(worker, "draft_owns_attention", False)),
+        worker.draft_parallel_layout,
         kv_helper=getattr(worker, "_fused_kv_helper", None),
     )
     return out
+
+
+def _around_start(original, worker, *args, **kwargs):
+    """SGLang's side-stream projection, unless this component already launched this step's (its result is taken by the
+    worker's own ``project_target_hidden`` call, on the worker's stream)."""
+    dm = getattr(worker, "draft_model", None)
+    if dm is not None and id(dm) in _pending:
+        if not torch.cuda.is_current_stream_capturing():
+            bed.count(NAME, "sglang overlap: superseded")
+        return None
+    return original(worker, *args, **kwargs)
 
 
 def register() -> bool:
@@ -843,6 +975,7 @@ def register() -> bool:
     HookRegistry.register(TARGET_INIT, _after_init, HookType.AFTER)
     HookRegistry.register(TARGET_FWD, _around_fwd, HookType.AROUND)
     HookRegistry.register(TARGET_PROJ, proj_hook, HookType.AROUND)
+    HookRegistry.register(TARGET_START, _around_start, HookType.AROUND)
     side_kv = enable_side_kv(HookRegistry, HookType)
     bed.report(NAME, True, side_gather=bed.flag(NAME + "_side_gather"), side_kv=side_kv)
     return True

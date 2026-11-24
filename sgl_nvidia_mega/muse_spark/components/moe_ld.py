@@ -93,6 +93,22 @@ PINS = {
     "sglang/srt/layers/muse_spark_fp4_moe.py": (
         "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
         "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+        # the experts call (hooked; its routed-MoE call and the finalize of the triple) and prepare_input (the early
+        # quant's AROUND hook; its per-token branch), at 3117f58 + #48948 and 306ccf6
+        bed.Functions(
+            {
+                "MuseSpark1xFp4Experts.__init__": (
+                    "997db56fae18e78f",
+                    "86211562f197827c",
+                ),
+                "MuseSpark1xFp4Experts.forward": "b0123c5c8460b210",
+                "MuseSpark1xFp4Experts.prepare_input": (
+                    "2c05166d10dbdde1",
+                    "18c9c22c720f18e0",
+                ),
+                "MuseSpark1xFp4Experts._finalize_deferred_output": "243e920761c83e15",
+            }
+        ),
     ),
     "sglang/srt/layers/quantization/muse_spark_nvfp4_moe.py": (
         "c09e0b4e32b7d5ac7af30caf74121dc0897e14e44f0e4503ea33a7acaf8f35a0",
@@ -106,6 +122,9 @@ _NONE_ARGS = (
     "gemm1_beta",
     "gemm1_clamp_limit",
     "gemm2_bias",
+    # FlashInfer 0.7.4: caller-owned scratch (needs do_finalize=True) and pre-built routing
+    "workspace_buffer",
+    "routing_metadata",
 )
 
 _tls = threading.local()
@@ -138,11 +157,29 @@ _state: dict = {
 
 EARLY_NAME = "moe_ldw_early"  # env MUSE_VR_MOE_LDW_EARLY (with moe_ldw)
 EARLY_PINS = {  # the quant the copy in csrc/norm_fp4_quant_early.cuh was taken from + its dispatcher
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_fp4_quant.cuh": "7bfbd40d531ab9809da3febcba719e04c178ea66e7fee665dffb81c699bd068b",
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_fp4_quant.cuh": (
+        "7bfbd40d531ab9809da3febcba719e04c178ea66e7fee665dffb81c699bd068b",
+        # 3117f58 + #48948: adds the static-scale mode only (kStaticScale = false is the per-token code the copy has)
+        "a1d08b5b20a5e1b0a5ab3c831a3f9f80297d8ba29bab267901da32c145053a94",
+    ),
     # the dispatcher module at both validated releases (the second: the same public function and JIT kernel, relocated)
     "sglang/kernels/ops/muse_spark_v12/norm_fp4_quant.py": (
         "17b954aef697cfb7d357b30a25a19810af0bbb85ba55e0496368b262fa872742",
         "f1c48a59a758f58751739859283a93b23f23540c065bf25bb6833f06113e301a",
+        # the public function, its JIT dispatch and the launch shape the copy mirrors (3117f58 + #48948, 306ccf6)
+        bed.Functions(
+            {
+                "_num_threads": "b5f5773e85e9f829",
+                "_jit_module": ("54a23b3fac82fe47", "04f2ddea2de7c9e6"),
+                "_fused_norm_fp4_quant_jit": (
+                    "19c6fd35415e4843",
+                    "4c9831d7554ac819",
+                ),
+                "_FusedNormFP4Quant.backend_eligible": "e43a0d012f4c6129",
+                "_FusedNormFP4Quant.forward_jit": "42293f464c6f5f74",
+                "fused_norm_fp4_quant": "4736e9fb088b713f",
+            }
+        ),
     ),
 }
 T_PREPARE = "sglang.srt.layers.muse_spark_fp4_moe.MuseSpark1xFp4Experts.prepare_input"
@@ -473,6 +510,10 @@ def _call_site(kw, lo: int = 1, hi: int = 0):
     if rsf is not None and float(rsf) != 1.0:
         return None
     if any(kw.get(k) is not None for k in _NONE_ARGS):
+        return None
+    if (
+        "nvfp4_4over6" in kw
+    ):  # FlashInfer 0.7.4: an explicit recipe (None too: the environment is then ignored)
         return None
     packed, hs, pts = (
         kw.get("topk_ids"),

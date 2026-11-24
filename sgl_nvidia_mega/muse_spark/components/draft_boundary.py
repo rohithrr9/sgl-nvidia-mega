@@ -36,7 +36,7 @@ attention output projection and MLP down projection with ``ops/draft_gemv.push``
 ``MUSE_VR_DRAFT_PUSH_TACTIC_DOWN``): the GEMV pushes its output vectors into the peers' one-shot push slots and the boundary
 kernel runs consumer-only (same vectors in the same slots as the boundary would push; the projection's fp32 summation order is
 the GEMV's, as for the other draft GEMVs; tests/dist_draft_push.py). Requires the boundary's whole-cluster layout (requests x
-cluster CTAs within the plane's block counters). ``MUSE_VR_DRAFT_PUSH_SITES`` (default ``o,down``) limits it to one of the two
+cluster CTAs within the plane's default launch width). ``MUSE_VR_DRAFT_PUSH_SITES`` (default ``o,down``) limits it to one of the two
 projections; the other boundary then keeps the stock projection and the boundary kernel's own exchange.
 ``MUSE_VR_DRAFT_PUSH_MC=1`` (default off; with ``MUSE_VR_DRAFT_PUSH_EPI=1`` and a push plane with a multicast address): the push
 GEMV stores each output vector once through the plane's multicast address instead of once per peer (the per-vector store count
@@ -65,7 +65,8 @@ pinned revision, table QK-norm + RoPE path) with ``ops/draft_qk.qk_norm_rope_qou
 ``table_qk_norm_rope_``: the same per-head arithmetic (bit-identical QKV, tests/test_draft_qk.py), and the rotated query
 heads are also written to a contiguous tensor that is handed to the attention layer, so the backend's copy of the
 strided query view into a contiguous tensor is a no-op. Engaged when every layer uses that path with bf16 projections,
-no value scale and no attention sinks.
+no value scale, no attention sinks, its KV write on and an fp32 rotary table (SGLang 3117f58 + #48948 rotates a bf16
+table in bf16).
 
 ``MUSE_VR_DRAFT_QK_WIDE=1`` (default off; only with this component) uses the same query/key call where this
 component steps aside (for example above ``MUSE_VR_DRAFT_BOUNDARY_MAX_ROWS`` rows): SGLang's draft forward runs
@@ -91,10 +92,11 @@ bit for bit against the served calls); any difference leaves layer 0 served. Mem
 2 x groups) bf16 per rank.
 
 Engaged per forward only for at most ``MUSE_VR_DRAFT_BOUNDARY_MAX_ROWS`` rows (default 64; tunable,
-tests/dist_draft_boundary.py --bench) and only when every layer has both block convolutions and plain (bf16,
-unfused) residual RMSNorms, the row count is a whole number of 8-token request blocks, the projections' stock
-all-reduce would be the custom all-reduce's one-shot push on a 2/4/8-rank group, no sequence-parallel or reduce
-override is active, the push slot holds the rows and the grid fits the plane's block counters. The decision depends only on facts every rank shares,
+tests/dist_draft_boundary.py --bench) and only when every layer has both block convolutions (unfused), plain (bf16,
+unfused) residual RMSNorms and non-MLA attention, the row count is a whole number of 8-token request blocks, the
+projections' stock all-reduce would be the custom all-reduce's one-shot push on a 2/4/8-rank group, no
+sequence-parallel or reduce override is active, the push slot holds the rows and the grid fits the plane's default
+launch width. The decision depends only on facts every rank shares,
 so all ranks take the same path. Kernels are built and loaded on the first eager call (warm-up before graph capture);
 a capture that finds them unloaded runs the stock forward.
 """
@@ -117,9 +119,9 @@ SGLANG_READS = {
     "srt/models/dflash.py": ("DFlashAttention", "_is_npu"),
     "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
     "srt/layers/layernorm.py": ("RMSNorm",),
+    "srt/layers/activation.py": ("SiluAndMul",),
     "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
     "srt/runtime_context.py": ("get_parallel", "get_forward"),
-    "srt/distributed/*.py": ("get_tp_group",),
     "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
         "CustomAllReduceV2",
     ),
@@ -129,10 +131,8 @@ SGLANG_READS = {
     "srt/layers/attention/flashattention_backend.py": ("FlashAttentionBackend",),
     "srt/layers/cp/utils.py": ("is_cp_active",),
     "srt/mem_cache/memory_pool.py": (
-        "KVWriteLoc",
         "MHATokenToKVPool",
         "maybe_detect_oob",
-        "unwrap_write_loc",
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
@@ -149,41 +149,134 @@ TARGET = "sglang.srt.models.dflash.DFlashDraftModel.forward"
 BLOCK = 8
 
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) whose behaviour the fused
-# forward reproduces: the draft model (forward, layers, convolution), the row-parallel linear and its all-reduce
-# dispatch, the RMSNorm module, the custom all-reduce (plane, protocol, kernel), the convolution's compiled source and
-# the draft QK-norm + RoPE kernel.
+# forward reproduces, or, for a ``bed.Functions`` entry, the token digests of the functions relied on there: the draft
+# model (forward, layers, convolution), the row-parallel linear and its all-reduce dispatch, the RMSNorm module, the
+# custom all-reduce (plane, protocol, kernel), the convolution's kernel, the draft QK-norm + RoPE kernel and the
+# attention backend's KV-write view.
+# SGLang 3117f58 + #48948 only where a Functions entry has one digest per function and no sha256 (the fused path
+# follows its push-plane protocol, CustomAllReduceV2._max_push_size and the draft model of 3117f58 + #48948).
 PINS = {
     "sglang/srt/models/dflash.py": (
-        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
-        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+        # the draft forward the fused forward mirrors (CUDA: unfused convolution, norm(finish(...), residual))
+        bed.Functions(
+            {
+                "DFlashDraftModel.forward": "5b3390e2c879ceb4",
+                "DFlashDecoderLayer.__init__": "64c4f4ec23131c87",
+                "DFlashDecoderLayer.forward": "35cbf09bb44e9f5d",
+                "DFlashGroupedConv.__init__": "bb200ce7adefbc94",
+                "DFlashGroupedConv._fused_applies": "67753964af60465f",
+                "DFlashGroupedConv._convolve": "33c4363cc77295b5",
+                "DFlashGroupedConv.prepare": "d144f01adfa1de07",
+                "DFlashGroupedConv.finish": "28716fa764b77753",
+                "DFlashGroupedConv.finish_add_norm": "1696a625c90b0c51",
+                "DFlashAttention.__init__": "00710456bf5598ff",
+                "DFlashAttention.forward": "2f24bd88941e8860",
+                "DFlashAttention.apply_attention_output": "d1c82815d2866931",
+                "DFlashMLP.__init__": "0d5764919dda8b09",
+                "DFlashMLP.forward": "3148281692928e03",
+            }
+        ),
     ),
-    "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+    # the convolution's CUDA kernel (DFlashGroupedConv._convolve), whose arithmetic the boundary kernel applies
+    "sglang/kernels/ops/speculative/dflash.py": (
+        bed.Functions(
+            {
+                "_dflash_grouped_conv_kernel": "62d03b0fdefcca54",
+                "dflash_grouped_conv": "2c9bdb839b699cc9",
+            }
+        ),
+    ),
+    "sglang/srt/layers/linear.py": (
+        "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
+        # the row-parallel dispatch _reduce_group mirrors, and the projections the GEMVs replace
+        bed.Functions(
+            {
+                "RowParallelLinear.__init__": ("b00d78e2e94f76bd", "f77a90b0905a6317"),
+                "RowParallelLinear.forward": ("1d5fb1eabbb87ec4", "b291a3c452e428a5"),
+                "ColumnParallelLinear.forward": "7538aefbf1cabf51",
+                "ReplicatedLinear.forward": "83d255ab98151104",
+            }
+        ),
+    ),
     "sglang/srt/distributed/parallel_state.py": (
         "49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7",
         "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d",
+        # the all-reduce dispatch ar_attn_boundary._stock_ar_is_one_shot_push reproduces
+        bed.Functions(
+            {
+                "GroupCoordinator.all_reduce": ("82c44defd3291bd6", "200c9d593d1e15eb"),
+                "GroupCoordinator._resolve_outplace_all_reduce_method": (
+                    "a107b53ca635241b",
+                    "01b4a6609d2e94b3",
+                ),
+                "GroupCoordinator._can_use_flashinfer_allreduce": "a1ce45c67d8629b4",
+                "GroupCoordinator._all_reduce_out_place": (
+                    "71c33c4f1f17247e",
+                    "244a957ddf2e362b",
+                ),
+                "outplace_all_reduce": "473d72b84304bb96",
+            }
+        ),
     ),
+    # SGLang 3117f58 + #48948 only (the gates read CustomAllReduceV2._max_push_size)
     "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
-        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
-        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+        bed.Functions(
+            {
+                "CustomAllReduceV2.__init__": "6871008b7ea3d24e",
+                "CustomAllReduceV2.should_custom_ar": "cb50aca228bfb484",
+                "CustomAllReduceV2.uses_one_shot_push": "b0f783101793ce04",
+                "CustomAllReduceV2.custom_all_reduce": "a10d0b9bb845cf6d",
+                "CustomAllReduceV2.obj": "4eba547724199cb9",
+                "CustomAllReduceV2.has_multicast": "41330e6743a2e1ad",
+            }
+        ),
     ),
-    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": (
-        "ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258",
-        "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a",
-    ),
-    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
+    # SGLang 3117f58 + #48948 only: the boundary and push-GEMV kernels follow its push-plane protocol
+    # (one EpochCounter phase word)
+    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": "fc38106be27066e0c691ce93e3b42435fb9b23f41830dd748104442d79c4915b",
+    "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "43315a3609675cc012be57e88622d19c2fa373126d03de018f87ef371e82f27b",
     "sglang/srt/layers/layernorm.py": (
         "98072d836e0c77312058521ee1015c80177b2c370da7408fd066eec61015ff21",
         "253ff80cef7def9af6caa4b4d700c1aaa7d133cf7c26f50da7d855a6a2ea0c21",
+        # the residual RMSNorm the boundary kernel replaces (its attributes and its CUDA path)
+        bed.Functions(
+            {
+                "RMSNorm.__init__": ("4cd16bc7ad8c96a1", "7b0138086622dc6e"),
+                "RMSNorm.forward_cuda": ("dbd32e038eb061b3", "0bc3e7f7022935cc"),
+            }
+        ),
     ),
     "sglang/srt/layers/moe/utils.py": (
         "dd4bc85f40ee72622631b8dee52ed8a6368bf4dc257a4a78228901d283a63dd0",
         "a0c0cc2eaa112e3b3e79db07814735f99c099ab9d80c6fd5cfa10f8890d26ce6",
+        bed.Functions({"should_skip_mlp_all_reduce": "c666c52481969672"}),
     ),
-    "sglang/srt/speculative/dflash_utils.py": (
-        "6e0423578bade4a8c58b921430df678840c6fa2de6ea411fe58eb77c98d5a820",
-        "35e885f930e95ed82a1f47a0dfa2dab583225d170c6cabe54f6c7bb4e3abbf79",
+    # the draft QK-norm + RoPE kernel ops/draft_qk mirrors (SGLang 3117f58 + #48948 moved it out of
+    # speculative/dflash_utils.py)
+    "sglang/kernels/ops/attention/table_qk_norm_rope.py": (
+        bed.Functions(
+            {
+                "_table_qk_norm_rope_kernel": "f57b3a1ca53b9e6f",
+                "table_qk_norm_rope_": "31e58e6d9aeffd9b",
+            }
+        ),
     ),
-    "sglang/srt/model_executor/forward_context.py": "63900e43eaf683bcc50991e56dac6d194566b9fcef2ed452ff8e5818e503d2d0",
+    "sglang/srt/model_executor/forward_context.py": (
+        "63900e43eaf683bcc50991e56dac6d194566b9fcef2ed452ff8e5818e503d2d0",
+        bed.Functions(
+            {
+                "get_attn_backend": "803112b60e772146",
+                "has_forward_context": "de4a241c9d7d6be9",
+            }
+        ),
+    ),
+    # the backend's view of its own KV write that _kv_store_target stores the draft K / V through
+    # (SGLang 3117f58 + #48948)
+    "sglang/srt/layers/attention/flashattention_backend.py": (
+        bed.Functions(
+            {"FlashAttentionBackend.get_fused_kv_write_buffers": "6d75860f4ef08c02"}
+        ),
+    ),
 }
 
 _state: dict = {"loaded": set()}
@@ -247,9 +340,8 @@ def _reduce_group(linear):
         return get_parallel().attn_tp_group
     if linear.parallel_group == "tp":
         return get_parallel().tp_group
-    from sglang.srt.distributed import get_tp_group
-
-    return get_tp_group()
+    # tensor_model_parallel_all_reduce: get_tp_group().all_reduce, and get_tp_group() is get_parallel().tp_group
+    return get_parallel().tp_group
 
 
 def _model_eligible(model, hidden: torch.Tensor):
@@ -271,6 +363,9 @@ def _model_eligible(model, hidden: torch.Tensor):
         return "hidden dtype", None
     if get_forward().sp_active:
         return "sequence parallel", None
+    # SGLang 3117f58 + #48948: DFlashMLAAttention layers (the forward passes zero_allocator)
+    if model.draft_config.is_mla:
+        return "mla draft attention", None
     layers = list(model.layers)
     norms = (
         [ly.input_layernorm for ly in layers]
@@ -289,6 +384,7 @@ def _model_eligible(model, hidden: torch.Tensor):
                 or conv.group_size != 16
                 or conv.block_size != BLOCK
                 or conv.base_kernel.dtype != torch.bfloat16
+                or conv.fused  # SGLang 3117f58 + #48948: ROCm's fused convolution (output side inside the next norm)
             ):
                 return "convolution shape", None
         for lin in (ly.self_attn.o_proj, ly.mlp.down_proj):
@@ -308,13 +404,13 @@ def _model_eligible(model, hidden: torch.Tensor):
         return "stock all-reduce not one-shot push", None
     cluster = op.cluster_for(m)
     if (
-        m * hdim * 2 > int(comm.max_push_size)
+        m * hdim * 2 > int(comm._max_push_size)  # the push slot its 1shot_push may use
         or int(comm.config.num_push_blocks) < cluster
     ):
         return "rows above push plane capacity", None
     split = op.split_from_env() if not op.poll_all_from_env() else 0
     if split and m * hdim * 2 + (m // op.BLOCK) * (split - 1) * hdim * 2 > int(
-        comm.max_push_size
+        comm._max_push_size
     ):
         split = 0  # the previous-row copies would not fit the slot: the plain kernel (as op.run decides the same way)
     key = (
@@ -520,6 +616,7 @@ def _gemv_eligible(model, m: int) -> bool:
         or m % BLOCK
     ):
         return False
+    from sglang.srt.layers.activation import SiluAndMul
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     from .ops import draft_gemv
@@ -535,8 +632,11 @@ def _gemv_eligible(model, m: int) -> bool:
     for ly in model.layers:
         for conv in (ly.attention_conv, ly.mlp_conv):
             kp = conv.kernel_projection
+            # SGLang 3117f58 + #48948: a ReplicatedLinear (was torch.nn.Linear), unquantized: x @ weight.T as before
             if (
-                type(kp) is not torch.nn.Linear
+                not isinstance(
+                    getattr(kp, "quant_method", None), UnquantizedLinearMethod
+                )
                 or kp.bias is not None
                 or kp.weight.dtype != torch.bfloat16
             ):
@@ -547,6 +647,8 @@ def _gemv_eligible(model, m: int) -> bool:
             or gu.bias is not None
             or (gu.weight.dtype != torch.bfloat16)
             or not gu.weight.is_contiguous()
+            # the swiglu GEMV computes SiLU-and-multiply (SGLang 3117f58 + #48948 also builds swigluoai)
+            or type(ly.mlp.act_fn) is not SiluAndMul
         ):
             return False
     return True
@@ -601,6 +703,10 @@ def _qk_eligible(model, flag_name: str = "draft_qk") -> bool:
             or not a.use_table_qk_norm_rope
             or a.v_scale is not None
             or (a.attention_sink_bias is not None)
+            # SGLang 3117f58 + #48948: a layer whose block skips its KV write (stock passes save_kv_cache=False), and a
+            # bf16 rotary table, which its table_qk_norm_rope_ now rotates in bf16 (ops/draft_qk: fp32, as before)
+            or not a.save_kv_cache
+            or a.rotary_emb.cos_sin_cache.dtype != torch.float32
         ):
             return False
         qp = a.qkv_proj
@@ -635,17 +741,13 @@ def _kv_store_target(
 ):
     """(write slots, K buffer, V buffer) when the attention backend's KV write for this layer would be a plain copy of the
     bf16 K / V rows into a token-major bf16 pool (FlashAttention backend, plain MHA pool, no scales, no MLA / context
-    parallelism / skipped cache); None otherwise (the backend writes as usual)."""
+    parallelism / skipped cache); None otherwise (the backend writes as usual). The slots and buffers are the backend's
+    own fused-writer view of that write (``get_fused_kv_write_buffers``, SGLang 3117f58 + #48948)."""
     if require_flag and not bed.flag("draft_qk_store"):
         return None
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
     from sglang.srt.layers.cp.utils import is_cp_active
-    from sglang.srt.mem_cache.memory_pool import (
-        KVWriteLoc,
-        MHATokenToKVPool,
-        maybe_detect_oob,
-        unwrap_write_loc,
-    )
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, maybe_detect_oob
 
     def no(reason):
         return why(reason) if why is not None else None
@@ -681,11 +783,12 @@ def _kv_store_target(
         or ra.v_scale is not None
     ):
         return no("kv write form")
-    loc_info = KVWriteLoc.for_layer(
-        forward_batch, ra, swa_loc=backend.forward_metadata.swa_out_cache_loc
-    )
-    pool._check_physical_write_loc(loc_info, "draft_boundary KV store")
-    loc = unwrap_write_loc(loc_info)[0]
+    # the token-major K / V buffers of this layer and the physical write slots the backend's own write uses; None where
+    # that write is not a plain copy (translated ids, sharded pool, DCP mask, ...)
+    fused = backend.get_fused_kv_write_buffers(ra, forward_batch)
+    if fused is None:
+        return no("kv write form")
+    kb, vb, loc = fused
     if (
         loc.dtype != torch.int64
         or loc.dim() != 1
@@ -696,8 +799,6 @@ def _kv_store_target(
             f"write slots {loc.dtype} {tuple(loc.shape)} contiguous={loc.is_contiguous()}"
         )
     maybe_detect_oob(loc, 0, pool.size + pool.page_size, "draft_boundary KV store")
-    kb = pool.k_buffer[ra.layer_id - pool.start_layer]
-    vb = pool.v_buffer[ra.layer_id - pool.start_layer]
     shape = (ra.tp_k_head_num, attn.head_dim)
     for b in (kb, vb):
         if (
@@ -1156,9 +1257,53 @@ WORKER_MODULE = "sglang.srt.speculative.dflash_worker_v2"
 # and the draft forward batch carrying the block ids as input_ids; the decode graph runner staging forward_batch.input_ids
 # into the static buffer the captured forward reads, and the buffer registry's copy of it
 TABLE_PINS = {
-    "sglang/srt/speculative/dflash_worker_v2.py": "93214d7935961f620475e85e14b418ae9054b84c9a549c1ea62720cdd7088c5d",
-    "sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "cee1cfcc527caa981f8ccf559572a499b6f176cbc086d3047e27c29ac8b48907",
-    "sglang/srt/model_executor/cuda_graph_buffer_registry.py": "81431f2d2ca2f36b9a1d80d011774bc6b707674f846cc93f65d380131593b6e2",
+    "sglang/srt/speculative/dflash_worker_v2.py": (
+        "93214d7935961f620475e85e14b418ae9054b84c9a549c1ea62720cdd7088c5d",
+        # SGLang 3117f58 + #48948: the hooked constructor (mask id, noise scale, merged mask embedding, full embedding)
+        # and the decode step's draft block [bonus, mask x 7], noise embedding and input_ids = the block ids
+        bed.Functions(
+            {
+                "DFlashWorkerV2.__init__": "2ea464419194bb42",
+                "DFlashWorkerV2.forward_batch_generation": "d05d129bac415b00",
+                "DFlashWorkerV2._ensure_draft_block_buffers": "4dc8f53a3fe39f1f",
+                "DFlashWorkerV2._cache_full_embed_weight": "53064fe81670a31d",
+                "DFlashWorkerV2._maybe_merge_trained_mask_embedding": "829b9547bdce5991",
+                "_resolve_dflash_embedding_module": "8ef751c52d1af753",
+            }
+        ),
+    ),
+    # the worker's block preparation kernel (block ids [bonus, mask x 7])
+    "sglang/kernels/ops/speculative/dflash.py": (
+        bed.Functions(
+            {
+                "_prepare_dflash_draft_block_contig_kernel": "f6a34785ab284005",
+                "_prepare_dflash_draft_block_unchecked": "f44959c2dfca8c13",
+            }
+        ),
+    ),
+    "sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": (
+        "cee1cfcc527caa981f8ccf559572a499b6f176cbc086d3047e27c29ac8b48907",
+        # SGLang 3117f58 + #48948: the replay's input_ids staging (fill_from or the pre-planned copy) into the static
+        # buffer the captured forward reads
+        bed.Functions(
+            {
+                "DecodeCudaGraphRunner.capture_prepare": "cf79b26a7e364330",
+                "DecodeCudaGraphRunner.load_batch": "1abbb00f4fe21390",
+                "DecodeCudaGraphRunner._copy_replay_inputs": "456a6dabf918d3ca",
+                "DecodeCudaGraphRunner._restage_is_redundant": "dec44ec98197e40e",
+                "build_replay_fb_view": "cf1aefeb488d6e56",
+            }
+        ),
+    ),
+    "sglang/srt/model_executor/cuda_graph_buffer_registry.py": (
+        "81431f2d2ca2f36b9a1d80d011774bc6b707674f846cc93f65d380131593b6e2",
+        bed.Functions(
+            {
+                "CudaGraphBufferRegistry.fill_from": "c9035f9bfc7f75df",
+                "_grouped_foreach_copy_": "7d6a947e5855c14b",
+            }
+        ),
+    ),
 }
 CHECK_BLOCKS = 512  # random blocks of the install-time eager check (plus the edge ids)
 CHECK_REPLAYS = 200  # CUDA-graph replays of the install-time replay check

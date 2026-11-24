@@ -44,8 +44,24 @@ OP_CLASS = "FusedPostExpertNormWeightedSumTRTLLM"
 # launch arguments; the CuTe-DSL kernel whose single-CTA arithmetic csrc/pfin.cuh reproduces). Either set must match.
 SGLANG_PIN_SETS = (
     {  # SGLang main layout
-        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce.py": "b22ba8b4d895fd38c99a0835b5a37b82adaa8e7587379f09807cb072eceb9948",
-        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py": "9e503382ec0d904476aa039d77510486cc71563c2e1a8bfcbb8d9234e7e2e689",
+        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce.py": (
+            "b22ba8b4d895fd38c99a0835b5a37b82adaa8e7587379f09807cb072eceb9948",
+            bed.Functions(
+                {
+                    "FusedPostExpertNormWeightedSumTRTLLM.forward_cute_dsl": (
+                        "9a1d02824e4f1d61",
+                        "1429fbf038221f5f",
+                    ),
+                    "FusedPostExpertNormWeightedSumTRTLLM.__init__": "8d32ea81e85cfaa8",
+                }
+            ),
+        ),
+        # whole-file digests: the kernel is defined under ``if HAS_CUTEDSL:``, out of a Functions entry's reach; the
+        # second is SGLang 3117f58 + #48948, whose single-CTA path without an all-reduce workspace computes as the first
+        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py": (
+            "9e503382ec0d904476aa039d77510486cc71563c2e1a8bfcbb8d9234e7e2e689",
+            "fb819abb9d771fcd0e4bc085380daf6ea40b4931c1966f61da86d7abe4683398",
+        ),
     },
     {  # original branch layout
         "sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_trtllm.py": "d2ba335e91affae92c8563a249f56cfaa2e54b84ae3f8d6d692624c105e0d048",
@@ -240,7 +256,7 @@ def engage() -> bool:
         _state["engaged"] = False
         return False
     if not any(
-        all(bed.file_sha256(rel) == sha for rel, sha in pins.items())
+        all(bed.pinned(rel, sha) for rel, sha in pins.items())
         for pins in SGLANG_PIN_SETS
     ):
         bed.report(NAME, False, reason="pin mismatch: finalize op / kernel sources")
