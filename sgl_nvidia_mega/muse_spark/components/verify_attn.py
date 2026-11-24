@@ -64,6 +64,11 @@
     merge kernel applies them with that configuration's arithmetic, bitwise (``tests/test_full_attn_wide_norm_gate.py``),
     and the stock call is skipped. Numerics: the rounding points of the stock kernel;
     key split, per-tile maxima, fp32 summation order and the merge order differ (``tests/test_full_attn_wide.py``).
+    With ``MUSE_VR_FULL_ATTN_WIDE_GMERGE=1`` the grouped-merge form of the op runs instead (``ops.full_attn_wide_l``): split
+    requests are merged by its grouped merge, which also applies the output norm and gate under the norm-gate conditions
+    of ``swa_verify_attn`` (``MUSE_VR_SWA_VERIFY_ATTN_NORM_GATE=1``), with its length-balanced split, in-kernel merge
+    forms and query/key prologue as that module describes; the package-only ``MUSE_VR_FULL_ATTN_WIDE_NORM_GATE`` and
+    ``MUSE_VR_FULL_ATTN_WIDE_SKEL`` are then reported and ignored.
     Every call that steps aside is counted with its reason and logged once per reason (WARNING).
 
 SWA-T (``MUSE_VR_SWA_T=1``, ``ops.swa_t``)
@@ -290,6 +295,8 @@ _state = {
     "ng16": False,
     "fullw_min": None,
     "fullw_pdl": True,
+    "fullw_qk": False,
+    "fullw_l": False,
     "swa_t": False,
     "swa_t_min": 12,
     "swa_t_max": 32,
@@ -410,6 +417,11 @@ def register() -> bool:
     triton_ok = qk_arith() is not None
     _state["qk"] = _state["swa"] and want_qk and triton_ok
     _state["fullw"] = want_fullw and pins_ok
+    from .ops import full_attn_wide_l as _fw_ops
+
+    # the grouped-merge full_attn_wide form (ops.full_attn_wide_l) serves when its grouped merge is on
+    # (MUSE_VR_FULL_ATTN_WIDE_GMERGE=1, a knob only that form reads)
+    _state["fullw_l"] = _fw_ops.gmerge_enabled()
     _state["fullw_ng"] = (
         _state["fullw"]
         and os.environ.get("MUSE_VR_FULL_ATTN_WIDE_NORM_GATE", "0").strip().lower()
@@ -434,6 +446,14 @@ def register() -> bool:
         and triton_ok
         and os.environ.get("MUSE_VR_FULL_VERIFY_ATTN_QK", "1").strip()
         not in ("0", "false", "no")
+    )
+    # full_attn_wide's prologue (default off): with the grouped merge, under attn_qk_prologue's conditions
+    _state["fullw_qk"] = (
+        _state["fullw"]
+        and want_qk
+        and triton_ok
+        and _fw_ops.qk_enabled()
+        and _fw_ops.gmerge_enabled()
     )
     _state["qk_max_reqs"] = _env_limit("qk_max_reqs")
     _state["full"] = want_full and pins_ok and _flashinfer_decode_pinned()
@@ -477,7 +497,23 @@ def register() -> bool:
             pdl=_state["fullv_pdl"],
             norm_gate=_state["norm_gate"],
         )
-    if want_fullw:
+    if want_fullw and _state["fullw_l"]:
+        from .ops import full_attn_wide_l as _fw
+
+        bed.report(
+            FULLW,
+            _state["fullw"],
+            pins=pins_ok,
+            min_reqs=_state["fullw_min"]
+            or "break-even per KV heads (and above full_verify_attn)",
+            pdl=_state["fullw_pdl"],
+            grouped_merge=_fw.gmerge_enabled(),
+            norm_gate=_state["norm_gate"] and _fw.gmerge_enabled(),
+            qk_prologue=_state["fullw_qk"],
+            length_balanced=_fw.lb_enabled() and _fw.gmerge_enabled(),
+            **_fullw_l_ignored(),
+        )
+    elif want_fullw:
         bed.report(
             FULLW,
             _state["fullw"],
@@ -661,10 +697,10 @@ def _qk_rope_args(attn, positions, qkv, kv_store):
     return positions, cos_sin, float(qkn._eps)
 
 
-def _qk_full_prologue_eps(attn, qkv, kv_store):
+def _qk_full_prologue_eps(attn, qkv, kv_store, flag="fullv_qk"):
     """eps when the stock fused QK-norm call of a layer without RoPE would run SGLang's Triton kernel on a row count
-    the full_verify_attn prologue covers, else None."""
-    if not _state["fullv_qk"] or kv_store is None:
+    the full_verify_attn (flag "fullv_qk") or full_attn_wide (flag "fullw_qk") prologue covers, else None."""
+    if not _state[flag] or kv_store is None:
         return None
     import sglang.kernels.fused_op as fused_op
     from sglang.kernels.spec import KernelBackend
@@ -1510,6 +1546,8 @@ def _fullw_skel_report() -> dict:
 
 
 def _fullw_reason(attn, qkv, forward_batch, backend):
+    if _state["fullw_l"]:
+        return _fullw_reason_l(attn, qkv, forward_batch, backend)
     from .ops import full_attn_wide as op
 
     layer = attn.attn
@@ -1577,6 +1615,8 @@ def _fullw_skel_selfcheck_counts(op) -> None:
 
 def _fullw_path(attn, positions, qkv, forward_batch, backend):
     """MuseSpark1xAttention.gated_attention with the attention call replaced (same order of operations)."""
+    if _state["fullw_l"]:
+        return _fullw_path_l(attn, positions, qkv, forward_batch, backend)
     from .ops import full_attn_wide as op
 
     layer = attn.attn
@@ -1634,6 +1674,176 @@ def _fullw_path(attn, positions, qkv, forward_batch, backend):
     if ng is not None:
         bed.count(FULLW, f"fused_norm_gate{ng[1]}_reqs{reqs}")
         return out
+    return attn._fused_o_norm_gate(out, o_gate)
+
+
+def _fullw_l_ignored() -> dict:
+    """The package-only full_attn_wide knobs that are set while the grouped-merge form serves (it does not read them)."""
+    names = [
+        n
+        for n in ("MUSE_VR_FULL_ATTN_WIDE_NORM_GATE", "MUSE_VR_FULL_ATTN_WIDE_SKEL")
+        if os.environ.get(n, "").strip().lower() not in ("", "0", "false", "no", "off")
+    ]
+    if not names:
+        return {}
+    logger.warning(
+        "muse_vr_plugin: %s: the grouped-merge form (MUSE_VR_FULL_ATTN_WIDE_GMERGE=1) ignores %s",
+        FULLW,
+        ", ".join(names),
+    )
+    return {"ignored": ",".join(names)}
+
+
+# The grouped-merge full_attn_wide form (ops.full_attn_wide_l), selected in _fullw_reason / _fullw_path.
+def _fullw_reason_l(attn, qkv, forward_batch, backend):
+    from .ops import full_attn_wide_l as op
+
+    layer = attn.attn
+    if layer.sliding_window_size is not None and layer.sliding_window_size >= 0:
+        return "sliding window layer"
+    reqs = qkv.shape[0] // TOKENS
+    lo = _state["fullw_min"]
+    if lo is None:
+        lo = op.BREAK_EVEN_REQUESTS.get(layer.tp_k_head_num, 1)
+        if _state["fullv"]:
+            lo = max(lo, _limit("fullv_max_reqs", layer.tp_k_head_num) + 1)
+    if reqs < lo:
+        return "requests below min"
+    if reqs > op.MAX_REQUESTS:
+        return "requests above 256"
+    if not op.supported(
+        layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, backend.page_size
+    ):
+        return "shape"
+    if backend.q_data_type != torch.bfloat16:
+        return "output dtype"
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is not None:
+        return "skip-softmax threshold set"
+    bmm1, bmm2 = backend._get_bmm_scales(layer)
+    if not isinstance(bmm1, float) or not isinstance(bmm2, float):
+        return "tensor scales"
+    key = (
+        qkv.device.type,
+        qkv.device.index,
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        _state["fullw_pdl"],
+    )
+    if torch.cuda.is_current_stream_capturing():
+        if key not in op._preloaded:
+            return "kernel not loaded before graph capture"
+    else:
+        op.preload(
+            layer.tp_q_head_num, layer.tp_k_head_num, qkv.device, _state["fullw_pdl"]
+        )
+    return None
+
+
+def _fullw_path_l(attn, positions, qkv, forward_batch, backend):
+    """MuseSpark1xAttention.gated_attention with the attention call replaced (same order of operations)."""
+    from .ops import full_attn_wide_l as op
+
+    layer = attn.attn
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
+    if attn.rotary_emb is not None:
+        return None
+    kv_store = attn._fused_kv_store(forward_batch)
+    if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
+        return None
+    k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
+        return None
+    if not (kv_store[0].is_contiguous() and kv_store[1].is_contiguous()):
+        return None
+    reqs_qk = qkv.shape[0] // TOKENS
+    if (
+        _state["fullw_qk"]
+        and 2 <= reqs_qk <= op.LB_MAX_REQUESTS
+        and op.num_blocks(qkv.device) >= reqs_qk
+    ):
+        qk_eps = _qk_full_prologue_eps(attn, qkv, kv_store, flag="fullw_qk")
+        # one call: q / K / V prologue + attention (+ norm + gate in the merge)
+        if qk_eps is not None:
+            m = qkv.shape[0]
+            hq, d = layer.tp_q_head_num, layer.head_dim
+            bmm1, bmm2 = backend._get_bmm_scales(layer)
+            md = backend.forward_metadata
+            out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=qkv.device)
+            eps = _norm_gate_eps(attn, qkv)
+            op.full_attn_wide(
+                None,
+                kv_store[0],
+                kv_store[1],
+                backend._get_layer_page_table(layer, forward_batch),
+                md.cache_seqlens_int32[:reqs_qk],
+                bmm1,
+                bmm2,
+                out=out.view(m, hq, d),
+                use_pdl=_state["fullw_pdl"],
+                gate=o_gate if eps is not None else None,
+                norm_eps=eps or 0.0,
+                gmerge=True,
+                qkv=qkv,
+                cache_loc=kv_store[2],
+                qk_eps=qk_eps,
+                num_q_heads=hq,
+            )
+            if eps is not None:
+                bed.count(FULLW, f"gmq_fused_qk_norm_gate_reqs{reqs_qk}")
+                return out
+            bed.count(FULLW, f"gmq_fused_qk_reqs{reqs_qk}")
+            return attn._fused_o_norm_gate(out, o_gate)
+    q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
+    if q.dtype != torch.float8_e4m3fn:
+        q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
+    m = q.shape[0]
+    reqs = m // TOKENS
+    hq, d = layer.tp_q_head_num, layer.head_dim
+    q3 = q.reshape(m, hq, d)
+    if (
+        q3.stride(2) != 1
+        or q3.stride(1) != d
+        or (q3.stride(0) * q3.element_size()) % 16
+        or q3.data_ptr() % 16
+    ):
+        q3 = q3.contiguous()
+    bmm1, bmm2 = backend._get_bmm_scales(layer)
+    md = backend.forward_metadata
+    out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
+    eps = _norm_gate_eps(attn, qkv) if op.gmerge_enabled() else None
+    op.full_attn_wide(
+        q3,
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        use_pdl=_state["fullw_pdl"],
+        gate=o_gate if eps is not None else None,
+        norm_eps=eps or 0.0,
+    )
+    # engagement prefix of the length-balanced split (the op applies it under these conditions)
+    lbt = (
+        "lb_"
+        if op.gmerge_enabled()
+        and op.lb_enabled()
+        and 1 <= reqs <= op.LB_MAX_REQUESTS
+        and op.num_blocks(q.device) >= reqs
+        else ""
+    )
+    if eps is not None:  # grouped merge with the output norm + gate in its epilogue
+        bed.count(FULLW, f"{lbt}gm_fused_norm_gate_reqs{reqs}")
+        return out
+    bed.count(FULLW, f"{lbt}{'gm_' if op.gmerge_enabled() else ''}reqs{reqs}")
     return attn._fused_o_norm_gate(out, o_gate)
 
 
