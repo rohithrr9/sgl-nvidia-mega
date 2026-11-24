@@ -9,6 +9,15 @@
 //   and its scan, the k-th largest bucket key, the candidate set (appended in any order) and the rank of each candidate
 //   by comparison against all others (ranks are unique because the composites are).
 //
+// select_wide2 (MUSE_VR_VERIFY_TOPK_TWO_LEVEL, default off): select_wide with the two all-pairs ranks bounded. A set of x
+//   composites (phase 1's bucket list, phase 2's candidates) larger than a cutoff (kNarrowList / kNarrowCand: a few
+//   hundred members, at least 2k; tunable) is first narrowed: a radix
+//   descent over the composite (12-bit digits from the top, the same 4096-bin histogram and scan as phase 1) fixes T so
+//   that at least k and at most 2k members are >= T; only those are ranked. Every member with a larger composite than
+//   a member >= T is itself >= T, so each kept member's rank, and therefore every written word, is the one the full rank
+//   gives. The rank itself is select_wide's all-pairs loop, unchanged. When the rows' top-k ids crowd into a few buckets,
+//   x grows to several times k; the ranked set no longer does.
+//
 // merge_sorted (one block per row): every rank's record holds its k entries in composite order (select writes rank r
 //   at position r). A candidate's rank in the union is therefore its position in its own record plus, for every other
 //   record, the number of entries with a larger composite, found by binary search in that record (its entries are
@@ -105,11 +114,105 @@ struct WideSmem {
   uint64_t thresh;
 };
 
-template <bool kPush>
-__global__ __launch_bounds__(kWideThreads) void select_wide_kernel(const __grid_constant__ SelectParams p,
-                                                                   const __grid_constant__ PushParams q) {
+// select_wide2: a set is narrowed only above a size cutoff (tunable):
+// phase 1's bucket list above kNarrowList, phase 2's candidates above
+// kNarrowCand. Both are at least 2 * kMaxK, so a narrowed set always keeps at least k and at most 2k members.
+constexpr int kNarrowList = 512;
+constexpr int kNarrowCand = 256;
+static_assert(kNarrowList >= 2 * kMaxK && kNarrowCand >= 2 * kMaxK, "narrow only sets larger than 2k");
+
+// select_wide2 only: the narrowed members of the set being ranked, placed after WideSmem in the dynamic shared memory
+struct TwoLevelSmem {
+  uint64_t surv[2 * kMaxK];
+  uint32_t sbits[2 * kMaxK];
+  int nsurv, nabove, digit;
+};
+
+// The digit d of sm.hist (bins owned from the top, thread 0 holding the highest, as phase 1's scan) with
+// above(d) < need <= above(d) + hist[d], where above(d) counts the members in higher bins: tl.digit = d, tl.nabove =
+// above(d). Every thread calls it; it holds one block barrier.
+SGL_DEVICE void find_digit(WideSmem& sm, TwoLevelSmem& tl, int need) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  constexpr int kPer = kBins / kWideThreads;
+  const int base = (kWideThreads - 1 - tid) * kPer;
+  int loc[kPer];
+  int tot = 0;
+#pragma unroll
+  for (int i = kPer - 1; i >= 0; --i) { loc[i] = sm.hist[base + i]; tot += loc[i]; }
+  int incl = tot;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    const int o = __shfl_up_sync(0xffffffffu, incl, off);
+    if (lane >= off) incl += o;
+  }
+  if (lane == 31) sm.wsum[warp] = incl;
+  __syncthreads();
+  // members in the bins of the lower-numbered warps (higher bins): one shuffle sum over this warp's lanes
+  int before = lane < warp ? sm.wsum[lane] : 0;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) before += __shfl_xor_sync(0xffffffffu, before, off);
+  int above = before + incl - tot;
+  if (above < need && above + tot >= need) {
+#pragma unroll
+    for (int i = kPer - 1; i >= 0; --i) {
+      if (above + loc[i] >= need) {
+        tl.digit = base + i;
+        tl.nabove = above;
+        break;
+      }
+      above += loc[i];
+    }
+  }
+}
+
+// A threshold T over the distinct composites arr[0, x) (x >= k) with k <= #{arr >= T} <= 2k: a radix descent from the
+// top bits (12-bit digits, then the last 4 bits), each level counting only the members that match the digits fixed so
+// far. T = those digits followed by zero bits. The composites are distinct, so the descent ends by the last level.
+// Every thread calls it with the same arguments; sm.hist is overwritten.
+SGL_DEVICE uint64_t narrow(WideSmem& sm, TwoLevelSmem& tl, const uint64_t* arr, int x, int k) {
+  const int tid = threadIdx.x;
+  uint64_t prefix = 0, mask = 0;
+  int need = k;
+  for (int lvl = 0; lvl < 6; ++lvl) {
+    const int shift = lvl < 5 ? 52 - 12 * lvl : 0;
+    const uint64_t dmask = lvl < 5 ? 0xFFFull : 0xFull;
+    for (int i = tid; i < kBins; i += kWideThreads) sm.hist[i] = 0;
+    __syncthreads();
+    for (int i = tid; i < x; i += kWideThreads) {
+      const uint64_t e = arr[i];
+      if ((e & mask) == prefix) atomicAdd(&sm.hist[static_cast<int>((e >> shift) & dmask)], 1);
+    }
+    __syncthreads();
+    find_digit(sm, tl, need);
+    __syncthreads();
+    const int d = tl.digit;
+    need -= tl.nabove;
+    prefix |= static_cast<uint64_t>(d) << shift;
+    mask |= dmask << shift;
+    const int ge = (k - need) + sm.hist[d];  // members >= prefix
+    __syncthreads();  // every thread has read hist / tl before the next level (or the caller) writes them
+    if (ge <= 2 * k) break;
+  }
+  return prefix;
+}
+
+// emit(i, arr[i], rank) for every i < x, rank = #{j : arr[j] > arr[i]}: select_wide's all-pairs loop (one member per
+// thread; every lane of a warp reads the same arr[j], a broadcast).
+template <typename F>
+SGL_DEVICE void rank_all(const uint64_t* arr, int x, F&& emit) {
+  for (int i = threadIdx.x; i < x; i += kWideThreads) {
+    const uint64_t me = arr[i];
+    int r = 0;
+    for (int j = 0; j < x; ++j) r += arr[j] > me ? 1 : 0;
+    emit(i, me, r);
+  }
+}
+
+template <bool kPush, bool kTwoLevel>
+__device__ __forceinline__ void select_wide_body(const SelectParams& p, const PushParams& q) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   WideSmem& sm = *reinterpret_cast<WideSmem*>(smem_raw);
+  TwoLevelSmem& tl = *reinterpret_cast<TwoLevelSmem*>(smem_raw + sizeof(WideSmem));  // kTwoLevel only
   __shared__ int32_t stage[kRecWords];  // kPush: this row's record before the tagged stores
   const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const uint32_t* bk = p.bkey + static_cast<int64_t>(row) * p.nb;
@@ -164,11 +267,28 @@ __global__ __launch_bounds__(kWideThreads) void select_wide_kernel(const __grid_
   __syncthreads();
   {
     const int m = sm.nlist;
-    for (int i = tid; i < m; i += kWideThreads) {
-      const uint64_t me = sm.list[i];
-      int r = 0;
-      for (int j = 0; j < m; ++j) r += sm.list[j] > me ? 1 : 0;
-      if (r == p.k - 1) sm.thresh = me;
+    if constexpr (kTwoLevel) {
+      const uint64_t* arr = sm.list;
+      int x = m;
+      if (m > kNarrowList) {  // narrow the list to the members >= T, then rank those only
+        if (tid == 0) tl.nsurv = 0;
+        const uint64_t t_lo = narrow(sm, tl, sm.list, m, p.k);
+        for (int i = tid; i < m; i += kWideThreads)
+          if (sm.list[i] >= t_lo) tl.surv[atomicAdd(&tl.nsurv, 1)] = sm.list[i];
+        __syncthreads();
+        arr = tl.surv;
+        x = tl.nsurv;
+      }
+      rank_all(arr, x, [&](int, uint64_t me, int r) {
+        if (r == p.k - 1) sm.thresh = me;
+      });
+    } else {
+      for (int i = tid; i < m; i += kWideThreads) {
+        const uint64_t me = sm.list[i];
+        int r = 0;
+        for (int j = 0; j < m; ++j) r += sm.list[j] > me ? 1 : 0;
+        if (r == p.k - 1) sm.thresh = me;
+      }
     }
   }
   __syncthreads();
@@ -210,13 +330,40 @@ __global__ __launch_bounds__(kWideThreads) void select_wide_kernel(const __grid_
   __syncthreads();
   const int n = sm.ncand;
   int32_t* o = kPush ? stage : p.out + static_cast<int64_t>(row) * p.out_ld;
-  for (int i = tid; i < n; i += kWideThreads) {
-    const uint64_t me = sm.cand[i];
-    int r = 0;
-    for (int j = 0; j < n; ++j) r += sm.cand[j] > me ? 1 : 0;
-    if (r < p.k) {
-      o[r] = static_cast<int32_t>(sm.cbits[i]);
-      o[p.k + r] = static_cast<int32_t>(comp_id(me)) + p.col_offset;
+  if constexpr (kTwoLevel) {
+    const uint64_t* arr = sm.cand;
+    const uint32_t* bits = sm.cbits;
+    int x = n;
+    if (n > kNarrowCand) {  // narrow the candidates to the members >= T, then rank those only
+      if (tid == 0) tl.nsurv = 0;
+      const uint64_t t_lo = narrow(sm, tl, sm.cand, n, p.k);
+      for (int i = tid; i < n; i += kWideThreads) {
+        if (sm.cand[i] >= t_lo) {
+          const int pos = atomicAdd(&tl.nsurv, 1);
+          tl.surv[pos] = sm.cand[i];
+          tl.sbits[pos] = sm.cbits[i];
+        }
+      }
+      __syncthreads();
+      arr = tl.surv;
+      bits = tl.sbits;
+      x = tl.nsurv;
+    }
+    rank_all(arr, x, [&](int i, uint64_t me, int r) {
+      if (r < p.k) {
+        o[r] = static_cast<int32_t>(bits[i]);
+        o[p.k + r] = static_cast<int32_t>(comp_id(me)) + p.col_offset;
+      }
+    });
+  } else {
+    for (int i = tid; i < n; i += kWideThreads) {
+      const uint64_t me = sm.cand[i];
+      int r = 0;
+      for (int j = 0; j < n; ++j) r += sm.cand[j] > me ? 1 : 0;
+      if (r < p.k) {
+        o[r] = static_cast<int32_t>(sm.cbits[i]);
+        o[p.k + r] = static_cast<int32_t>(comp_id(me)) + p.col_offset;
+      }
     }
   }
   // 3. argmax
@@ -250,6 +397,18 @@ __global__ __launch_bounds__(kWideThreads) void select_wide_kernel(const __grid_
       }
     }
   }
+}
+
+template <bool kPush>
+__global__ __launch_bounds__(kWideThreads) void select_wide_kernel(const __grid_constant__ SelectParams p,
+                                                                   const __grid_constant__ PushParams q) {
+  select_wide_body<kPush, false>(p, q);
+}
+
+template <bool kPush>
+__global__ __launch_bounds__(kWideThreads) void select_wide2_kernel(const __grid_constant__ SelectParams p,
+                                                                    const __grid_constant__ PushParams q) {
+  select_wide_body<kPush, true>(p, q);
 }
 
 struct SoftmaxParams {
@@ -372,6 +531,18 @@ __global__ __launch_bounds__(kMergeThreads) void merge_sorted_kernel(const __gri
 struct VerifyTopKFast {
   static void select(const tvm::ffi::TensorView s, const tvm::ffi::TensorView bkey, const tvm::ffi::TensorView amax,
                      const tvm::ffi::TensorView out, int64_t col_offset, int64_t k, int64_t has_amax) {
+    select_impl<false>(s, bkey, amax, out, col_offset, k, has_amax);
+  }
+
+  // MUSE_VR_VERIFY_TOPK_TWO_LEVEL: the same records through select_wide2 (bounded ranks)
+  static void select2(const tvm::ffi::TensorView s, const tvm::ffi::TensorView bkey, const tvm::ffi::TensorView amax,
+                      const tvm::ffi::TensorView out, int64_t col_offset, int64_t k, int64_t has_amax) {
+    select_impl<true>(s, bkey, amax, out, col_offset, k, has_amax);
+  }
+
+  template <bool kTwoLevel>
+  static void select_impl(const tvm::ffi::TensorView s, const tvm::ffi::TensorView bkey, const tvm::ffi::TensorView amax,
+                          const tvm::ffi::TensorView out, int64_t col_offset, int64_t k, int64_t has_amax) {
     using namespace host;
     auto R = SymbolicSize{"rows"};
     auto C = SymbolicSize{"cols"};
@@ -408,15 +579,15 @@ struct VerifyTopKFast {
     p.out = static_cast<int32_t*>(out.data_ptr());
     p.out_ld = O.unwrap();
     p.hoist = 1;
-    constexpr std::size_t smem = sizeof(WideSmem);
+    constexpr std::size_t smem = sizeof(WideSmem) + (kTwoLevel ? sizeof(TwoLevelSmem) : 0);
+    auto kernel = kTwoLevel ? select_wide2_kernel<false> : select_wide_kernel<false>;
     static bool attr_set = false;
     if (!attr_set) {
-      RuntimeDeviceCheck(::cudaFuncSetAttribute(select_wide_kernel<false>,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+      RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                static_cast<int>(smem)));
       attr_set = true;
     }
-    LaunchKernel(static_cast<unsigned>(rows), kWideThreads, device_.unwrap(), smem)(select_wide_kernel<false>, p,
-                                                                                    PushParams{});
+    LaunchKernel(static_cast<unsigned>(rows), kWideThreads, device_.unwrap(), smem)(kernel, p, PushParams{});
   }
 
   static void merge(const tvm::ffi::TensorView in, const tvm::ffi::TensorView vals, const tvm::ffi::TensorView ids,

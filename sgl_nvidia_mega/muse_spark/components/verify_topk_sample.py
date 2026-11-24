@@ -56,6 +56,9 @@ when the fused kernel does not take the call, ``torch.rand`` runs as before (eac
 ``MUSE_VR_SPARSE_FINAL_LEVEL_MERGE=1`` (default off; with ``MUSE_VR_SPARSE_FINAL=1``): that kernel merges the tile sums'
 leaves level by level in one warp instead of one thread per tile, so its time no longer grows with the number of top-k
 ids that fall in one tile; same tree, same sums, same bits.
+``MUSE_VR_VERIFY_TOPK_TWO_LEVEL=1`` (default off; with ``MUSE_VR_VERIFY_TOPK_FAST=1``): the shard select bounds its two
+ranks (``topk_two_level``), so its time no longer grows when a row's top-k ids crowd into a few 64-column buckets; same
+records, bit for bit.
 
 Engaged only when every request samples with the same ``top_k`` in [2, 64], ``top_p`` 1, no penalties, logit bias,
 custom logit processor, grammar, logprobs or sampling-mask capture, the selector path without block verification,
@@ -502,6 +505,15 @@ def topk_fast() -> bool:
     return bed.flag("verify_topk_fast")
 
 
+def topk_two_level() -> bool:
+    """``MUSE_VR_VERIFY_TOPK_TWO_LEVEL=1`` (default off; with MUSE_VR_VERIFY_TOPK_FAST): the shard select runs
+    ``select_wide2`` (``csrc/verify_topk_fast.cuh``), whose two ranks are bounded: a set larger than a cutoff of a few
+    hundred members (the bucket list, the candidates; they grow when a row's top-k ids crowd into a few buckets) is
+    first narrowed by a radix descent to the members at or above a threshold, at least k and at most 2k of them, and
+    only those are ranked. Same records, bit for bit (tests/test_verify_topk_two_level.py)."""
+    return bed.flag("verify_topk_two_level")
+
+
 @functools.lru_cache(maxsize=None)
 def module_fast():
     from sglang.kernels.jit.utils import load_jit
@@ -511,6 +523,7 @@ def module_fast():
         cuda_files=[str(_CUH_FAST)],
         cuda_wrappers=[
             ("select", "muse_vr::verify_topk_fast::VerifyTopKFast::select"),
+            ("select2", "muse_vr::verify_topk_fast::VerifyTopKFast::select2"),
             ("merge", "muse_vr::verify_topk_fast::VerifyTopKFast::merge"),
             (
                 "merge_softmax",
@@ -1045,7 +1058,10 @@ def local_records(
     else:
         has_amax = 1
     if topk_fast():
-        module_fast().select(s, bkey, amax, rec, int(col_offset), int(k), has_amax)
+        if topk_two_level():
+            module_fast().select2(s, bkey, amax, rec, int(col_offset), int(k), has_amax)
+        else:
+            module_fast().select(s, bkey, amax, rec, int(col_offset), int(k), has_amax)
     else:
         module().select(
             s, bkey, amax, rec, int(col_offset), int(k), has_amax, int(select_hoist())
@@ -1654,6 +1670,7 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
             pull=pull,
             fused=fused,
             level_merge=bool(fused and bed.flag("sparse_final_level_merge")),
+            two_level=bool(fast and topk_two_level()),
         )
         _state["in_preload"] = True
         # collective set-up first: every rank reaches this point on the same step with the same k and settings
