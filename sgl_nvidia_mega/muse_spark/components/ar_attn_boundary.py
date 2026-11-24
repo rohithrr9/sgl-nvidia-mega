@@ -402,7 +402,13 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
 
     attn = layer.self_attn
     # MuseSpark1xAttention.forward with the o_proj all-reduce deferred
-    qkv, _ = attn.qkv_proj(attn_input)
+    from . import qkv_qk_fold
+
+    # the projection with the QK-norm epilogue where it applies (default off)
+    if qkv_qk_fold.active():
+        qkv = qkv_qk_fold.project(attn, attn_input, forward_batch, positions)
+    else:
+        qkv, _ = attn.qkv_proj(attn_input)
     partial, _ = attn.o_proj(
         attn.gated_attention(positions, qkv, forward_batch), skip_all_reduce=True
     )

@@ -69,6 +69,7 @@ COMPONENTS = (
     "input_norm",
     "verify_mk",  # own hook target (install_megakernel); wraps layer instances, outside every class-level hook
     "verify_attn",
+    "qkv_qk_fold",  # no hook: ar_attn_boundary / verify_attn call it (reads verify_attn's decisions per call)
     "kv4_dec",  # after verify_attn: its hook wraps verify_attn's
     "moe_ld",  # before moe_tail: wraps the experts' forward and the routed-MoE call
     "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call

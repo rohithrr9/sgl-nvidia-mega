@@ -268,6 +268,11 @@ MUSE_SPARK_LEASE_READS = {
         "forced_algo",
     ),
     "srt/layers/communication/muse_spark_gemm_ag.py": ("muse_workspace",),
+    "srt/layers/quantization/unquant.py": (
+        "_BF16_LOW_M_AUTOTUNE_MAX_M",
+        "_active_warp_splitk_tactics",
+        "_mm_bf16",
+    ),
     "srt/mem_cache/memory_pool.py": ("window_write_locs",),
     "srt/models/dflash.py": (
         "_fused_candidate_all_gather",

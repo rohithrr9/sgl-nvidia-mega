@@ -1044,7 +1044,15 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
     bmm1, bmm2 = backend._get_bmm_scales(layer)
     md = backend.forward_metadata
     eps = _norm_gate_eps(attn, qkv)
-    qk_args = _qk_prologue_args(attn, positions, qkv, kv_store) if fuse_rope else None
+    from . import qkv_qk_fold
+
+    # the queries the QKV projection's QK-norm epilogue wrote (it also stored the K / V rows): no prologue, no QK-norm call
+    q_fold = qkv_qk_fold.take(attn, qkv, kv_store) if qkv_qk_fold.active() else None
+    qk_args = (
+        _qk_prologue_args(attn, positions, qkv, kv_store)
+        if fuse_rope and q_fold is None
+        else None
+    )
     if qk_args is not None:
         pos, cos_sin, qk_eps = qk_args
         out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=qkv.device)
@@ -1077,14 +1085,17 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
             return out
         bed.count(SWA, f"fused_reqs{reqs}")
         return attn._fused_o_norm_gate(out, o_gate)
-    if _state["qk"]:
-        bed.count(QK, "unfused")
-    if fuse_rope:
-        q, k = attn._fused_qk_norm(
-            qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store
-        )
+    if q_fold is not None:
+        q = q_fold
     else:
-        q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
+        if _state["qk"]:
+            bed.count(QK, "unfused")
+        if fuse_rope:
+            q, k = attn._fused_qk_norm(
+                qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store
+            )
+        else:
+            q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
     if q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
@@ -1800,7 +1811,12 @@ def _fullw_path_l(attn, positions, qkv, forward_batch, backend):
                 return out
             bed.count(FULLW, f"gmq_fused_qk_reqs{reqs_qk}")
             return attn._fused_o_norm_gate(out, o_gate)
-    q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
+    from . import qkv_qk_fold
+
+    # the queries the QKV projection's QK-norm epilogue wrote (it also stored the K / V rows), else the stock call
+    q = qkv_qk_fold.take(attn, qkv, kv_store) if qkv_qk_fold.active() else None
+    if q is None:
+        q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
     if q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
     m = q.shape[0]
