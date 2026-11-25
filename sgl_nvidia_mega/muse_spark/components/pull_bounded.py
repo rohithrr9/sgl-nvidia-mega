@@ -70,10 +70,10 @@ PINS = {
 
 # sha256 of csrc/pull_gather_bounded.cuh (bitwise, fault and sanitizer tests: tests/dist_pull_bounded.py); any other
 # file is not used.
-SOURCE_SHA256 = "c222050e33798c2e3178e638601ea401fc36c6fc61b271c0836c44c004f5b8c0"
+SOURCE_SHA256 = "ab7a753bbeb0632ebd559cdab61880ded62ee3d4b482f054954fe28d6c99a9fb"
 # the row-layout copy (csrc/pull_gather_rows.cuh): same kernel with a row-layout store entry, used only through all_gather_pull_rows
 _ROWS_CUH = Path(__file__).resolve().parent / "csrc" / "pull_gather_rows.cuh"
-ROWS_SOURCE_SHA256 = "ee8279b811b48c1cb58c2a4b59b47e996ff23c6d6f14c90cac5b5fda40cd01db"
+ROWS_SOURCE_SHA256 = "64bda53b7c1e7cc9fa62d582ef10984b700ddc79179f629a7545cd4ab266c26e"
 
 _state: dict = {"engaged": None, "max_polls": None}
 
