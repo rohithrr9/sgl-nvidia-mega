@@ -60,11 +60,12 @@ MODULE = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
 RUST_CORE_CLASSES = ("RustUnifiedTreeCore",)
 HOOK_TARGET = "sglang.srt.mem_cache.unified_cache.tree_core_registry.create_tree_core"
 
-# The validated torch build: torch.__version__ and torch.version.git_version of the pinned image.
-TORCH_VERSION = "2.15.0.dev20261005+cu134"
-TORCH_GIT = "7bf52b3a9782d3440a17eb3f00983795f3b12af0"
+# The validated torch build: torch.__version__ and torch.version.git_version of the pinned image (the SGLang 3117f58
+# nightly image).
+TORCH_VERSION = "2.15.0+cu134"
+TORCH_GIT = "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e"
 # sha256 of the bundled module file (sglang/srt/mem_cache/rust_tree_core/mem_cache.cpython-312-aarch64-linux-gnu.so).
-MODULE_SHA256 = "4537c75d00d1a46b2b6fd8b4afb1aa5c0dcae6e2cd56ac22b519e18b857e0390"
+MODULE_SHA256 = "d47d720ca056d30036281fc0fd8325893841fef0e32ec1f117cb528209ceee5b"
 # SGLang sources whose behaviour this mechanism relies on (range check, registry fallback, loader shortcut, hook target).
 PINS = {
     "sglang/srt/rust_extensions/torch_build.py": (

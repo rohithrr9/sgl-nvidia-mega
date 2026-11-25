@@ -17,7 +17,7 @@ import os
 
 ENV = "MUSE_VR_MOE_MMA_K"
 # the form whose rows the unit tests read bitwise equal to each FlashInfer version's routed NVFP4 MoE
-LISTED = {"0.7.1": 64, "0.7.2": 128}
+LISTED = {"0.7.1": 64, "0.7.2": 128, "0.7.4": 128}
 DEFINES = {
     "moe_ld": "MUSE_VR_MOELD_K128",
     "moe_ldtp": "MUSE_VR_MOELD_K128",

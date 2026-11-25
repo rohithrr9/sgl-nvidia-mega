@@ -125,6 +125,7 @@ PINS = {
 VALIDATED_TORCH = (
     "e0474491d782a73b73cf132f732a8513b3c9f49d",
     "7bf52b3a9782d3440a17eb3f00983795f3b12af0",
+    "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e",
 )
 _loaded: set = set()
 
